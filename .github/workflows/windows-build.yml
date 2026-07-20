@@ -1,0 +1,19 @@
+name: Windows Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        shell: pwsh
+        run: ./scripts/build-debug.ps1
+      - name: Test
+        shell: pwsh
+        run: ./scripts/run-tests.ps1

@@ -1,0 +1,101 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "vs2022-x64-debug",
+      "displayName": "Visual Studio 2022 x64 Debug",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/vs2022-x64-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "GIFLER_BUILD_SPIKES": "ON",
+        "GIFLER_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "vs2022-x64-release",
+      "displayName": "Visual Studio 2022 x64 Release",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/vs2022-x64-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "GIFLER_BUILD_SPIKES": "ON",
+        "GIFLER_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "vs2026-x64-debug",
+      "displayName": "Visual Studio 2026 x64 Debug",
+      "generator": "Visual Studio 18 2026",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/vs2026-x64-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "GIFLER_BUILD_SPIKES": "ON",
+        "GIFLER_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "vs2026-x64-release",
+      "displayName": "Visual Studio 2026 x64 Release",
+      "generator": "Visual Studio 18 2026",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/vs2026-x64-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "GIFLER_BUILD_SPIKES": "ON",
+        "GIFLER_BUILD_TESTS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "vs2022-x64-debug",
+      "configuration": "Debug"
+    },
+    {
+      "name": "release",
+      "configurePreset": "vs2022-x64-release",
+      "configuration": "Release"
+    },
+    {
+      "name": "debug-vs2026",
+      "configurePreset": "vs2026-x64-debug",
+      "configuration": "Debug"
+    },
+    {
+      "name": "release-vs2026",
+      "configurePreset": "vs2026-x64-release",
+      "configuration": "Release"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "vs2022-x64-debug",
+      "configuration": "Debug",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "release",
+      "configurePreset": "vs2022-x64-release",
+      "configuration": "Release",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "debug-vs2026",
+      "configurePreset": "vs2026-x64-debug",
+      "configuration": "Debug",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "release-vs2026",
+      "configurePreset": "vs2026-x64-release",
+      "configuration": "Release",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}

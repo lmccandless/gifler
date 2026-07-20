@@ -1,0 +1,13 @@
+Gifler
+Copyright (C) 2026 lmccandless
+
+This distribution is licensed under the GNU Affero General Public License,
+version 3 only. See LICENSE.
+
+Redistributions and modified versions must preserve the copyright, license,
+and attribution notices required by the AGPL. No permission is granted to use
+the Gifler project name or original branding to imply that a modified build is
+an official release. Descriptive use for attribution is permitted.
+
+Third-party encoders are not included. FFmpeg, gifski, and gifsicle remain
+subject to their own licenses when installed separately by a user.
