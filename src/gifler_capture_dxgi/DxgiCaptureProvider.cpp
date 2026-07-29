@@ -201,105 +201,209 @@ bool overlay_cursor(gifler::core::PixelRect desktopRect, gifler::core::BgraFrame
     return true;
 }
 
-bool is_all_black_bgr(const gifler::core::BgraFrame& frame) {
-    if (frame.empty()) {
-        return false;
-    }
-    const auto* pixels = reinterpret_cast<const unsigned char*>(frame.pixels.data());
-    for (int y = 0; y < frame.height; ++y) {
-        const auto* row = pixels + static_cast<std::size_t>(y) * static_cast<std::size_t>(frame.stride);
-        for (int x = 0; x < frame.width; ++x) {
-            const auto* pixel = row + static_cast<std::size_t>(x) * 4u;
-            if (pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0) {
-                return false;
-            }
-        }
-    }
-    return true;
-}
-
-bool capture_gdi_frame(gifler::core::PixelRect desktopRect, gifler::core::BgraFrame& output, std::wstring* error) {
-    HDC screenDc = GetDC(nullptr);
-    if (screenDc == nullptr) {
-        if (error != nullptr) {
-            *error = L"GetDC(nullptr) failed: " + gifler::win32::hresult_message(HRESULT_FROM_WIN32(GetLastError()));
-        }
-        return false;
-    }
-
-    HDC memoryDc = CreateCompatibleDC(screenDc);
-    if (memoryDc == nullptr) {
-        ReleaseDC(nullptr, screenDc);
-        if (error != nullptr) {
-            *error = L"CreateCompatibleDC failed: " + gifler::win32::hresult_message(HRESULT_FROM_WIN32(GetLastError()));
-        }
-        return false;
-    }
-
-    BITMAPINFO info{};
-    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    info.bmiHeader.biWidth = desktopRect.width;
-    info.bmiHeader.biHeight = -desktopRect.height;
-    info.bmiHeader.biPlanes = 1;
-    info.bmiHeader.biBitCount = 32;
-    info.bmiHeader.biCompression = BI_RGB;
-
-    void* dibBits = nullptr;
-    HBITMAP bitmap = CreateDIBSection(screenDc, &info, DIB_RGB_COLORS, &dibBits, nullptr, 0);
-    if (bitmap == nullptr || dibBits == nullptr) {
-        if (bitmap != nullptr) {
-            DeleteObject(bitmap);
-        }
-        DeleteDC(memoryDc);
-        ReleaseDC(nullptr, screenDc);
-        if (error != nullptr) {
-            *error = L"CreateDIBSection failed: " + gifler::win32::hresult_message(HRESULT_FROM_WIN32(GetLastError()));
-        }
-        return false;
-    }
-
-    HGDIOBJ previous = SelectObject(memoryDc, bitmap);
-    constexpr DWORD rop = SRCCOPY | CAPTUREBLT;
-    const BOOL copied = BitBlt(memoryDc, 0, 0, desktopRect.width, desktopRect.height, screenDc, desktopRect.x, desktopRect.y, rop);
-    SelectObject(memoryDc, previous);
-
-    if (!copied) {
-        DeleteObject(bitmap);
-        DeleteDC(memoryDc);
-        ReleaseDC(nullptr, screenDc);
-        if (error != nullptr) {
-            *error = L"BitBlt desktop capture failed: " + gifler::win32::hresult_message(HRESULT_FROM_WIN32(GetLastError()));
-        }
-        return false;
-    }
-
-    output.width = desktopRect.width;
-    output.height = desktopRect.height;
-    output.stride = desktopRect.width * 4;
-    output.pixels.resize(static_cast<std::size_t>(output.stride) * static_cast<std::size_t>(output.height));
-    std::memcpy(output.pixels.data(), dibBits, output.pixels.size());
-
-    auto* pixels = reinterpret_cast<unsigned char*>(output.pixels.data());
-    for (int y = 0; y < output.height; ++y) {
-        auto* row = pixels + static_cast<std::size_t>(y) * static_cast<std::size_t>(output.stride);
-        for (int x = 0; x < output.width; ++x) {
-            row[static_cast<std::size_t>(x) * 4u + 3u] = 255;
-        }
-    }
-
-    DeleteObject(bitmap);
-    DeleteDC(memoryDc);
-    ReleaseDC(nullptr, screenDc);
-
-    LARGE_INTEGER qpc{};
-    QueryPerformanceCounter(&qpc);
-    output.timestampTicks = qpc.QuadPart;
-    output.durationTicks = 0;
-    output.changedBounds = gifler::core::PixelRect{0, 0, output.width, output.height};
-    return true;
-}
-
 } // namespace
+
+struct DxgiCaptureProvider::Impl {
+    SelectedOutput selected{};
+    ComPtr<ID3D11Device> device{};
+    ComPtr<ID3D11DeviceContext> context{};
+    ComPtr<IDXGIOutputDuplication> duplication{};
+    ComPtr<ID3D11Texture2D> staging{};
+    gifler::core::PixelRect outputRect{};
+    gifler::core::PixelRect stagingRect{};
+    gifler::core::PixelRect cachedRect{};
+    gifler::core::BgraFrame cachedFrame{};
+    DXGI_FORMAT stagingFormat = DXGI_FORMAT_UNKNOWN;
+
+    ~Impl() {
+        reset();
+    }
+
+    void reset() {
+        cachedFrame = {};
+        cachedRect = {};
+        staging.Reset();
+        duplication.Reset();
+        if (context != nullptr) {
+            context->ClearState();
+            context->Flush();
+        }
+        context.Reset();
+        device.Reset();
+        selected = {};
+        outputRect = {};
+        stagingRect = {};
+        stagingFormat = DXGI_FORMAT_UNKNOWN;
+    }
+
+    bool contains(gifler::core::PixelRect rect) const {
+        return duplication != nullptr && gifler::core::intersection(rect, outputRect) == rect;
+    }
+
+    bool initialize(gifler::core::PixelRect rect, std::wstring* error) {
+        reset();
+        if (!select_output_for_rect(rect, selected, error) ||
+            !create_d3d_device_for_adapter(selected.adapter.Get(), device, context, error)) {
+            reset();
+            return false;
+        }
+
+        ComPtr<IDXGIOutput1> output1;
+        HRESULT hr = selected.output.As(&output1);
+        if (FAILED(hr)) {
+            if (error != nullptr) {
+                *error = L"IDXGIOutput1 not available: " + gifler::win32::hresult_message(hr);
+            }
+            reset();
+            return false;
+        }
+
+        hr = output1->DuplicateOutput(device.Get(), &duplication);
+        if (FAILED(hr)) {
+            if (error != nullptr) {
+                *error = L"DuplicateOutput failed: " + gifler::win32::hresult_message(hr);
+            }
+            reset();
+            return false;
+        }
+
+        const RECT& coordinates = selected.desc.DesktopCoordinates;
+        outputRect = {coordinates.left, coordinates.top, coordinates.right - coordinates.left,
+                      coordinates.bottom - coordinates.top};
+        return true;
+    }
+
+    bool ensure_staging(const D3D11_TEXTURE2D_DESC& sourceDesc, gifler::core::PixelRect rect, std::wstring* error) {
+        if (staging != nullptr && stagingRect.width == rect.width && stagingRect.height == rect.height &&
+            stagingFormat == sourceDesc.Format) {
+            return true;
+        }
+
+        D3D11_TEXTURE2D_DESC stagingDesc = sourceDesc;
+        stagingDesc.Width = static_cast<UINT>(rect.width);
+        stagingDesc.Height = static_cast<UINT>(rect.height);
+        stagingDesc.MipLevels = 1;
+        stagingDesc.ArraySize = 1;
+        stagingDesc.SampleDesc.Count = 1;
+        stagingDesc.SampleDesc.Quality = 0;
+        stagingDesc.Usage = D3D11_USAGE_STAGING;
+        stagingDesc.BindFlags = 0;
+        stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        stagingDesc.MiscFlags = 0;
+
+        ComPtr<ID3D11Texture2D> replacement;
+        const HRESULT hr = device->CreateTexture2D(&stagingDesc, nullptr, &replacement);
+        if (FAILED(hr)) {
+            if (error != nullptr) {
+                *error = L"Create staging texture failed: " + gifler::win32::hresult_message(hr);
+            }
+            return false;
+        }
+
+        staging = std::move(replacement);
+        stagingRect = {0, 0, rect.width, rect.height};
+        stagingFormat = sourceDesc.Format;
+        return true;
+    }
+
+    bool capture(gifler::core::PixelRect rect, gifler::core::BgraFrame& output, std::wstring* error) {
+        if (!contains(rect) && !initialize(rect, error)) {
+            return false;
+        }
+
+        DXGI_OUTDUPL_FRAME_INFO frameInfo{};
+        ComPtr<IDXGIResource> desktopResource;
+        HRESULT hr = duplication->AcquireNextFrame(250, &frameInfo, &desktopResource);
+        if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+            if (cachedRect == rect && !cachedFrame.empty()) {
+                output = cachedFrame;
+                LARGE_INTEGER qpc{};
+                QueryPerformanceCounter(&qpc);
+                output.timestampTicks = qpc.QuadPart;
+                return true;
+            }
+            if (error != nullptr) {
+                *error = L"Timed out waiting for the first desktop frame.";
+            }
+            return false;
+        }
+        if (FAILED(hr)) {
+            if (error != nullptr) {
+                *error = L"AcquireNextFrame failed: " + gifler::win32::hresult_message(hr);
+            }
+            reset();
+            return false;
+        }
+
+        struct ReleaseFrameGuard {
+            IDXGIOutputDuplication* value = nullptr;
+            ~ReleaseFrameGuard() {
+                if (value != nullptr) {
+                    value->ReleaseFrame();
+                }
+            }
+        } releaseFrame{duplication.Get()};
+
+        ComPtr<ID3D11Texture2D> desktopTexture;
+        hr = desktopResource.As(&desktopTexture);
+        if (FAILED(hr)) {
+            if (error != nullptr) {
+                *error = L"Captured desktop resource was not a texture: " + gifler::win32::hresult_message(hr);
+            }
+            return false;
+        }
+
+        D3D11_TEXTURE2D_DESC sourceDesc{};
+        desktopTexture->GetDesc(&sourceDesc);
+        if (!ensure_staging(sourceDesc, rect, error)) {
+            return false;
+        }
+
+        D3D11_BOX sourceBox{};
+        sourceBox.left = static_cast<UINT>(rect.x - outputRect.x);
+        sourceBox.top = static_cast<UINT>(rect.y - outputRect.y);
+        sourceBox.front = 0;
+        sourceBox.right = sourceBox.left + static_cast<UINT>(rect.width);
+        sourceBox.bottom = sourceBox.top + static_cast<UINT>(rect.height);
+        sourceBox.back = 1;
+        context->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, desktopTexture.Get(), 0, &sourceBox);
+
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        hr = context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+        if (FAILED(hr)) {
+            if (error != nullptr) {
+                *error = L"Map staging texture failed: " + gifler::win32::hresult_message(hr);
+            }
+            return false;
+        }
+
+        output.width = rect.width;
+        output.height = rect.height;
+        output.stride = rect.width * 4;
+        output.pixels.resize(static_cast<std::size_t>(output.stride) * static_cast<std::size_t>(output.height));
+        const auto* source = static_cast<const unsigned char*>(mapped.pData);
+        auto* destination = reinterpret_cast<unsigned char*>(output.pixels.data());
+        for (int y = 0; y < output.height; ++y) {
+            std::memcpy(destination + static_cast<std::size_t>(y) * static_cast<std::size_t>(output.stride),
+                        source + static_cast<std::size_t>(y) * static_cast<std::size_t>(mapped.RowPitch),
+                        static_cast<std::size_t>(output.width) * 4u);
+        }
+        context->Unmap(staging.Get(), 0);
+
+        LARGE_INTEGER qpc{};
+        QueryPerformanceCounter(&qpc);
+        output.timestampTicks = qpc.QuadPart;
+        output.durationTicks = 0;
+        output.changedBounds = {0, 0, output.width, output.height};
+        cachedRect = rect;
+        cachedFrame = output;
+        return true;
+    }
+};
+
+DxgiCaptureProvider::DxgiCaptureProvider() : impl_(std::make_unique<Impl>()) {}
+
+DxgiCaptureProvider::~DxgiCaptureProvider() = default;
 
 bool DxgiCaptureProvider::is_available(std::wstring* error) const {
     ComPtr<IDXGIFactory1> factory;
@@ -375,15 +479,13 @@ bool DxgiCaptureProvider::capture_one_frame(gifler::core::PixelRect desktopRect,
 
     SelectedOutput selected;
     if (!select_output_for_rect(desktopRect, selected, error)) {
-        return capture_gdi_frame(desktopRect, output, error) &&
-               (!captureCursor || overlay_cursor(desktopRect, output, error));
+        return false;
     }
 
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
     if (!create_d3d_device_for_adapter(selected.adapter.Get(), device, context, error)) {
-        return capture_gdi_frame(desktopRect, output, error) &&
-               (!captureCursor || overlay_cursor(desktopRect, output, error));
+        return false;
     }
 
     ComPtr<IDXGIOutput1> output1;
@@ -392,8 +494,7 @@ bool DxgiCaptureProvider::capture_one_frame(gifler::core::PixelRect desktopRect,
         if (error != nullptr) {
             *error = L"IDXGIOutput1 not available: " + gifler::win32::hresult_message(hr);
         }
-        return capture_gdi_frame(desktopRect, output, error) &&
-               (!captureCursor || overlay_cursor(desktopRect, output, error));
+        return false;
     }
 
     ComPtr<IDXGIOutputDuplication> duplication;
@@ -403,8 +504,7 @@ bool DxgiCaptureProvider::capture_one_frame(gifler::core::PixelRect desktopRect,
             *error = L"DuplicateOutput failed. Close protected/fullscreen surfaces and try again. Details: " +
                      gifler::win32::hresult_message(hr);
         }
-        return capture_gdi_frame(desktopRect, output, error) &&
-               (!captureCursor || overlay_cursor(desktopRect, output, error));
+        return false;
     }
 
     DXGI_OUTDUPL_FRAME_INFO frameInfo{};
@@ -514,13 +614,6 @@ bool DxgiCaptureProvider::capture_one_frame(gifler::core::PixelRect desktopRect,
     output.durationTicks = 0;
     output.changedBounds = gifler::core::PixelRect{0, 0, output.width, output.height};
 
-    if (is_all_black_bgr(output)) {
-        gifler::core::BgraFrame gdiFrame;
-        if (capture_gdi_frame(desktopRect, gdiFrame, error)) {
-            output = std::move(gdiFrame);
-        }
-    }
-
     if (captureCursor && !overlay_cursor(desktopRect, output, error)) {
         return false;
     }
@@ -528,14 +621,18 @@ bool DxgiCaptureProvider::capture_one_frame(gifler::core::PixelRect desktopRect,
 }
 
 bool DxgiCaptureProvider::capture_composed_frame(gifler::core::PixelRect desktopRect, gifler::core::BgraFrame& output,
-                                                 std::wstring* error, bool captureCursor) const {
+                                                 std::wstring* error, bool captureCursor) {
     if (desktopRect.empty()) {
         if (error != nullptr) {
             *error = L"Capture rectangle is empty.";
         }
         return false;
     }
-    return capture_gdi_frame(desktopRect, output, error) && (!captureCursor || overlay_cursor(desktopRect, output, error));
+
+    if (!impl_->capture(desktopRect, output, error)) {
+        return false;
+    }
+    return !captureCursor || overlay_cursor(desktopRect, output, error);
 }
 
 } // namespace gifler::capture_dxgi

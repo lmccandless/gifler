@@ -131,7 +131,7 @@ void RecorderSession::start_dxgi(RecorderSettings settings, std::function<gifler
             } else {
                 ++consecutiveFailures;
                 set_last_error(std::move(error));
-                if (consecutiveFailures >= 3 && queue->size() == 0) {
+                if (consecutiveFailures >= 3) {
                     state_ = RecorderState::Failed;
                     break;
                 }

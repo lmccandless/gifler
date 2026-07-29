@@ -62,35 +62,6 @@ bool clear_window_region(HWND hwnd, std::wstring* error) {
     return true;
 }
 
-bool enable_colorkey_transparency(HWND hwnd, COLORREF transparentColor, std::wstring* error) {
-    SetLastError(ERROR_SUCCESS);
-    const LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-    if (style == 0 && GetLastError() != ERROR_SUCCESS) {
-        if (error != nullptr) {
-            *error = last_error_message();
-        }
-        return false;
-    }
-
-    if ((style & WS_EX_LAYERED) == 0) {
-        SetLastError(ERROR_SUCCESS);
-        if (SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED) == 0 && GetLastError() != ERROR_SUCCESS) {
-            if (error != nullptr) {
-                *error = last_error_message();
-            }
-            return false;
-        }
-    }
-
-    if (!SetLayeredWindowAttributes(hwnd, transparentColor, 0, LWA_COLORKEY)) {
-        if (error != nullptr) {
-            *error = last_error_message();
-        }
-        return false;
-    }
-    return true;
-}
-
 bool set_window_excluded_from_capture(HWND hwnd, bool excluded, std::wstring* error) {
     HMODULE user32 = GetModuleHandleW(L"user32.dll");
     if (user32 == nullptr) {

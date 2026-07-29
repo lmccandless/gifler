@@ -20,7 +20,6 @@ constexpr wchar_t WindowClassName[] = L"GiflerNativeMainWindow";
 constexpr UINT_PTR PreviewTimerId = 3001;
 constexpr UINT SaveProgressMessage = WM_APP + 1;
 constexpr UINT SaveCompleteMessage = WM_APP + 2;
-constexpr COLORREF TransparentViewfinderColor = RGB(1, 0, 1);
 
 int duration_ticks_to_timer_ms(std::int64_t durationTicks) {
     if (durationTicks <= 0) {
@@ -82,14 +81,12 @@ bool MainWindow::create(HINSTANCE instance, int showCommand) {
 
     const int initialWidth = scaled(660);
     const int initialHeight = scaled(390);
-    hwnd_ = CreateWindowExW(WS_EX_TOPMOST | WS_EX_LAYERED, WindowClassName, L"Gifler",
+    hwnd_ = CreateWindowExW(WS_EX_TOPMOST, WindowClassName, L"Gifler",
                             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, initialWidth, initialHeight,
                             nullptr, nullptr, instance_, this);
     if (hwnd_ == nullptr) {
         return false;
     }
-    win32::enable_colorkey_transparency(hwnd_, TransparentViewfinderColor);
-
     ShowWindow(hwnd_, showCommand);
     UpdateWindow(hwnd_);
     apply_capture_or_preview_region();
@@ -233,6 +230,7 @@ LRESULT MainWindow::window_proc(UINT message, WPARAM wParam, LPARAM lParam) {
     case WM_DESTROY:
         KillTimer(hwnd_, PreviewTimerId);
         recorder_.stop();
+        win32::clear_window_region(hwnd_);
         if (saveThread_.joinable()) {
             saveThread_.join();
         }
@@ -393,12 +391,6 @@ void MainWindow::paint() {
     if (previewMode_) {
         FillRect(dc, &vf, GetSysColorBrush(COLOR_WINDOW));
         paint_preview_frame(dc);
-    } else {
-        HBRUSH transparentBrush = CreateSolidBrush(TransparentViewfinderColor);
-        if (transparentBrush != nullptr) {
-            FillRect(dc, &vf, transparentBrush);
-            DeleteObject(transparentBrush);
-        }
     }
 
     EndPaint(hwnd_, &ps);
@@ -408,7 +400,15 @@ void MainWindow::apply_capture_or_preview_region() {
     if (hwnd_ == nullptr) {
         return;
     }
-    InvalidateRect(hwnd_, nullptr, TRUE);
+
+    std::wstring error;
+    const bool applied = previewMode_ ? win32::clear_window_region(hwnd_, &error)
+                                      : win32::apply_viewfinder_hole_region(hwnd_, viewfinder_client_rect(), &error);
+    if (!applied && !error.empty()) {
+        statusText_ = L"Viewfinder error: " + error;
+        update_window_title();
+    }
+    RedrawWindow(hwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN);
 }
 
 void MainWindow::update_status_rect_text() {

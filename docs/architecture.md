@@ -27,6 +27,12 @@ Export worker        materializes frames and runs encoder processes.
 
 The capture thread must never encode. The recording queue must be bounded.
 
+The capture thread owns one DXGI Desktop Duplication session for the recording
+lifetime. It must release the acquired frame, duplication object, staging
+texture, D3D context, and device when recording stops. Product recording must
+not fall back to `BitBlt`/`CAPTUREBLT`; a DXGI failure stops recording with an
+error instead of repeatedly forcing DWM compositor readback.
+
 ## Windowing Approach
 
 The preferred approach is one top-level HWND with the viewfinder cut out using `SetWindowRgn`. The region is switched back to a full region during preview playback so the app can paint into the viewfinder.

@@ -3,6 +3,7 @@
 #include "gifler_core/Frame.h"
 #include "gifler_core/Geometry.h"
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -16,6 +17,11 @@ struct MonitorInfo {
 
 class DxgiCaptureProvider {
 public:
+    DxgiCaptureProvider();
+    ~DxgiCaptureProvider();
+    DxgiCaptureProvider(const DxgiCaptureProvider&) = delete;
+    DxgiCaptureProvider& operator=(const DxgiCaptureProvider&) = delete;
+
     [[nodiscard]] bool is_available(std::wstring* error = nullptr) const;
     [[nodiscard]] std::vector<MonitorInfo> enumerate_monitors(std::wstring* error = nullptr) const;
 
@@ -26,7 +32,11 @@ public:
 
     // Captures the composed desktop pixels that are visible through Gifler's layered viewfinder.
     [[nodiscard]] bool capture_composed_frame(gifler::core::PixelRect desktopRect, gifler::core::BgraFrame& output,
-                                              std::wstring* error = nullptr, bool captureCursor = false) const;
+                                              std::wstring* error = nullptr, bool captureCursor = false);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 } // namespace gifler::capture_dxgi

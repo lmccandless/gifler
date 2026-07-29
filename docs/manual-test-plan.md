@@ -19,6 +19,9 @@
 - Main `Gifler.exe` Rec/Stop captures the physical viewfinder rectangle, not a synthetic source.
 - Capture rejects or clips invalid rectangles.
 - Display changes produce clean errors.
+- Record hardware-accelerated browser, video, and game windows, then stop and close Gifler.
+- Confirm `dwm.exe` CPU returns to its pre-recording baseline and native window dragging remains smooth.
+- Repeat Record/Stop ten times and confirm no cumulative compositor slowdown.
 
 ## S03 Cursor Recording
 
