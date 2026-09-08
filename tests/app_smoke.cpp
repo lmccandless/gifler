@@ -323,7 +323,15 @@ struct MainWindowTestAccess {
             std::cout << "App create failed: " << GetLastError() << "\n";
             return false;
         }
-        const bool chromeOk = aspect_test(app) && chrome_test(app, directory) && resize_test(app, directory);
+        bool tooltipPresent = false;
+        EnumThreadWindows(GetCurrentThreadId(), [](HWND window, LPARAM value) -> BOOL {
+            wchar_t name[64]{};
+            GetClassNameW(window, name, 64);
+            if (_wcsicmp(name, TOOLTIPS_CLASSW) == 0) *reinterpret_cast<bool*>(value) = true;
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&tooltipPresent));
+        std::cout << (tooltipPresent ? "Unexpected tooltip window created.\n" : "No tooltip windows created.\n");
+        const bool chromeOk = !tooltipPresent && aspect_test(app) && chrome_test(app, directory) && resize_test(app, directory);
         std::cout << (chromeOk ? "Chrome, geometry, DPI, FPS, and settings checks passed.\n" : "Chrome checks FAILED.\n");
         gifler::record::RecorderSettings settings;
         settings.fps = 30;

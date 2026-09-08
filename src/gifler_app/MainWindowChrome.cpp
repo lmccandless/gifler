@@ -52,15 +52,10 @@ void MainWindow::refresh_fonts() {
     uiFont_ = font(L"Segoe UI", 11, FW_NORMAL);
     titleFont_ = font(L"Segoe UI", 12, FW_SEMIBOLD);
     iconFont_ = font(L"Segoe MDL2 Assets", 11, FW_NORMAL);
-    if (tooltips_) SendMessageW(tooltips_, WM_SETFONT, reinterpret_cast<WPARAM>(uiFont_), TRUE);
 }
 
 void MainWindow::create_chrome() {
     refresh_fonts();
-    tooltips_ = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
-                               CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
-                               hwnd_, nullptr, instance_, nullptr);
-    SendMessageW(tooltips_, TTM_SETMAXTIPWIDTH, 0, scaled(300));
     struct Button { int id; const wchar_t* name; };
     for (const auto& button : {Button{RecButton, L"Record"}, {FpsButton, L"Frame rate"},
             {FormatButton, L"Export format and size target"}, {PlayButton, L"Play preview"},
@@ -70,12 +65,6 @@ void MainWindow::create_chrome() {
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 1, 1,
             hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(button.id)), instance_, nullptr);
         SetWindowSubclass(child, button_proc, 1, 0);
-        TOOLINFOW tip{sizeof(tip)};
-        tip.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
-        tip.hwnd = hwnd_;
-        tip.uId = reinterpret_cast<UINT_PTR>(child);
-        tip.lpszText = const_cast<wchar_t*>(button.name);
-        SendMessageW(tooltips_, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tip));
     }
     refresh_chrome();
 }
@@ -145,11 +134,6 @@ void MainWindow::refresh_chrome() {
     const auto label = [&](int id, const wchar_t* text) {
         HWND child = GetDlgItem(hwnd_, id);
         SetWindowTextW(child, text);
-        TOOLINFOW tip{sizeof(tip)};
-        tip.hwnd = hwnd_;
-        tip.uId = reinterpret_cast<UINT_PTR>(child);
-        tip.lpszText = const_cast<wchar_t*>(text);
-        SendMessageW(tooltips_, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&tip));
     };
     label(RecButton, recording_ ? L"Stop recording" : L"Record");
     label(SaveButton, saving_ ? L"Cancel export" : L"Save recording");

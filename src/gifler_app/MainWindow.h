@@ -165,7 +165,6 @@ private:
     HMENU aspectMenu_ = nullptr;
     HMENU audioRateMenu_ = nullptr;
     HWND saveProgress_ = nullptr;
-    HWND tooltips_ = nullptr;
     HFONT uiFont_ = nullptr;
     HFONT titleFont_ = nullptr;
     HFONT iconFont_ = nullptr;

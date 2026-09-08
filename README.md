@@ -24,7 +24,7 @@ Gifler is an unsigned early-preview executable. Windows SmartScreen may ask for 
 - Resize from any inner edge or corner, with directional cursors and hover marks.
 - Lock the capture region to 16:9, 9:16, 1:1, 4:5, 4:3, or 3:4 while resizing.
 - Dark camera-inspired frame with a single 34-pixel control strip, compact icons,
-  tooltips, and DPI-aware controls. No bottom bar or minimize/maximize buttons.
+  accessible button names, and DPI-aware controls. No tooltip popups, bottom bar, or minimize/maximize buttons.
 - 5, 10, 15, 24, 30, 48, 60, and 120 FPS presets, plus custom 1-240 FPS.
 - GIF, H.264 MP4, animated WebP, and VP9 WebM export.
 - Optional system audio in exported MP4 (AAC) and WebM (Opus).

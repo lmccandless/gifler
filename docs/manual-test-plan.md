@@ -76,7 +76,7 @@
 
 - Launch one native `Gifler.exe`.
 - Confirm Record, FPS, format, Play, Copy, Save, and More appear in the compact toolbar.
-- Confirm icon tooltips and accessible button names identify every command.
+- Confirm accessible button names identify every command. Hover each toolbar button while idle and recording: no tooltip popup should appear, even after the usual hover delay. Inspect the exported recording for unwanted UI overlays.
 - Confirm less-common commands are under `More`.
 - Confirm the brand and all controls share one 34-pixel-high top strip. No bottom
   status bar or minimize/maximize buttons. Spare top-row space can show status.
