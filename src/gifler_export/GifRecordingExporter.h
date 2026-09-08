@@ -1,6 +1,8 @@
 #pragma once
 
 #include "gifler_core/Frame.h"
+#include "gifler_core/Audio.h"
+#include "gifler_core/Geometry.h"
 #include "gifler_export/EncoderDiscovery.h"
 #include "gifler_export/GifExportPlanner.h"
 
@@ -36,7 +38,11 @@ struct VideoExportRequest {
     int width = 0;
     double targetMb = 10.0;
     int quality = 75;
+    bool socialCompatibility = false;
+    int audioSampleRate = 48000;
     ExportProgressCallback progress{};
+    std::function<bool()> canceled{};
+    const gifler::core::AudioRecording* audio = nullptr;
 };
 
 struct VideoExportSummary {
@@ -59,6 +65,8 @@ struct VideoExportSummary {
     int fps);
 [[nodiscard]] int calculate_h264_bitrate_kbps(std::int64_t durationTicks, double targetMb);
 [[nodiscard]] std::wstring video_format_name(VideoExportFormat format);
+[[nodiscard]] std::wstring build_social_video_filter(gifler::core::PixelSize source, int requestedWidth = 0);
+[[nodiscard]] std::vector<std::wstring> video_audio_arguments(VideoExportFormat format, int sampleRate);
 [[nodiscard]] std::wstring build_ffmpeg_h264_pass1_command(const std::filesystem::path& ffmpegPath,
                                                            const std::filesystem::path& framesPattern,
                                                            const std::filesystem::path& passLogPath,

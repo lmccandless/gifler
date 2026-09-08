@@ -7,7 +7,7 @@
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     INITCOMMONCONTROLSEX controls{};
     controls.dwSize = sizeof(controls);
-    controls.dwICC = ICC_STANDARD_CLASSES | ICC_PROGRESS_CLASS;
+    controls.dwICC = ICC_STANDARD_CLASSES | ICC_PROGRESS_CLASS | ICC_UPDOWN_CLASS;
     InitCommonControlsEx(&controls);
 
     gifler::win32::enable_per_monitor_dpi_awareness_best_effort();

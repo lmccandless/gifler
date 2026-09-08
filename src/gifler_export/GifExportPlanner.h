@@ -40,6 +40,7 @@ struct GifExportRequest {
     int maxColors = 256;
     GifDitherMode dither = GifDitherMode::Sierra2_4A;
     std::function<void(int)> progress{};
+    std::function<bool()> canceled{};
 };
 
 struct TargetSizeOptions {

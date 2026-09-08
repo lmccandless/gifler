@@ -19,7 +19,6 @@ if (!(Test-Path $exe)) {
 }
 
 $stage = Join-Path $dist "stage"
-Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 Copy-Item $exe $stage
 Copy-Item $exe $portableExe -Force

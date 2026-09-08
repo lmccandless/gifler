@@ -2,6 +2,63 @@
 
 Fill this in as soon as each spike is run.
 
+## 2026-09-08 Chrome and FPS Follow-up
+
+- Dropdown-width follow-up: native font measurement now determines FPS/format
+  widths and arrow position, removing unused space after short labels. Exact-width
+  assertions cover 5 FPS/GIF, 30 FPS/MP4, 240 FPS/WebM, and mixed display scaling.
+- VSync investigation is recorded in `display-sync-exploration.md`. No capture
+  pacing or desktop/compositor behavior was changed by this UI revision.
+
+- Spacing/resize follow-up: separated dropdown arrow/text bounds, clipped and
+  double-buffered button painting, suppressed native white erases, and batched
+  child positioning without intermediate repainting. Full-row threshold is now
+  290 logical pixels to retain readable spacing.
+- Right/bottom handles widened to 10 logical pixels with an extended bottom-right
+  diagonal target. Native hit-test and region-membership assertions passed.
+- Re-ran Debug build, unit tests, custom-dialog/save/cancel UI smoke, and native
+  renders/text-fit assertions at 100/125/150/200% scaling. Live resize animation
+  remains a manual confirmation rather than an offscreen-test guarantee.
+
+- Subsequent compact revision: charcoal camera-style single 34-pixel top strip,
+  no bottom bar, no minimize/maximize buttons, 18/20-pixel icon controls, and a
+  6-pixel record dot. Full controls fit at 248 logical pixels; smaller windows
+  retain Record/Save/More/Close with secondary actions in More.
+- Revalidated control bounds, label text extents (including 240 FPS/WebM), native
+  rendered pixels, capture-hole geometry, settings, custom FPS, and GIF save/cancel.
+
+- Kept `SetWindowRgn` for the actual capture hole. Replaced the OS-drawn caption
+  and menu bar with custom-painted chrome and accessible native buttons; no DWM,
+  compatibility, or global theme settings are changed.
+- Native offscreen renders inspected at 120/360/660 logical-pixel widths and
+  100/150/200% scaling. Bounds checks and region membership checks passed.
+- Custom FPS dialog rejects empty, nonnumeric, 0, and 241; applying 77 succeeds,
+  cancellation preserves it, and presets/custom preferences round-trip.
+- Unit and UI smoke passed, including asynchronous GIF saving/cancellation.
+- FFmpeg/ffprobe verified one-second MP4s at 60, 77, 120, and 240 FPS with the
+  expected frame counts. Existing audio and 10/90-second export tests also pass.
+- Live capture cadence, mixed-monitor interaction, window snapping, high-contrast
+  mode, and assistive-technology behavior remain manual checks.
+
+Icon glyphs use the Windows-provided
+[Segoe MDL2 Assets font](https://learn.microsoft.com/en-us/windows/apps/design/iconography/segoe-ui-symbol-font),
+so no production dependency was added.
+
+## 2026-09-08 Regression Validation
+
+- Debug unit tests passed, including cumulative frame timing, 20 MB/audio setting
+  persistence, and audio interval splicing for edits.
+- Export smoke passed with external FFmpeg: GIF and MP4 10.000 s, WebM 10.008 s,
+  WebP 9.999 s; all contain 300 video frames. MP4/WebM contain audio. A coalesced
+  90-second GIF preserved 90.000 s. Encoder error/cancel/retry checks passed.
+- Hidden-window UI smoke passed: compact menus, restart persistence, asynchronous
+  GIF export completion, and cancellation preserving the recording. Isolated
+  settings were used; no live desktop capture or clipboard replacement occurred.
+- WASAPI loopback probe passed on the default device: 48 kHz, 400632 captured bytes
+  over the one-second probe, no reported error. No audio file was retained.
+- Manual moving-content capture cadence, audible A/V sync, actual clipboard paste,
+  and hardware-accelerated-window compositor behavior remain manual checks.
+
 | Spike | Result | Final Decision | Product Impact | Follow-up Tasks |
 | --- | --- | --- | --- | --- |
 | S01 Window Hole | Launch smoke passed 2026-06-04; manual click-through not yet validated | Keep single HWND + `SetWindowRgn` candidate pending manual click-through and DPI proof | Product can keep viewfinder-hole prototype as preferred approach, but must not promote until manual pass | Run click-through against Notepad/browser at 100%, 125%, 150%, mixed DPI |

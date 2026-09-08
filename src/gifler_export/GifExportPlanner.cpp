@@ -20,8 +20,8 @@ std::vector<int> unique_descending(std::vector<int> values) {
 
 std::vector<int> fps_ladder(int requested, int minimum) {
     requested = std::max(1, requested);
-    minimum = std::max(1, minimum);
-    std::vector<int> values{requested, 30, 24, 20, 15, 12, 10, 8, 6, minimum};
+    minimum = std::clamp(minimum, 1, requested);
+    std::vector<int> values{requested, 120, 60, 48, 30, 24, 20, 15, 12, 10, 8, 6, minimum};
     values.erase(std::remove_if(values.begin(), values.end(), [&](int fps) { return fps > requested || fps < minimum; }), values.end());
     return unique_descending(values);
 }

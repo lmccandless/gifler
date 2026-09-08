@@ -4,6 +4,7 @@
 #include "gifler_core/Geometry.h"
 #include "gifler_record/BoundedFrameQueue.h"
 #include "gifler_record/InMemoryFrameStore.h"
+#include "gifler_record/LoopbackAudio.h"
 
 #include <atomic>
 #include <functional>
@@ -27,6 +28,7 @@ struct RecorderSettings {
     int fps = 10;
     std::size_t queueCapacity = 8;
     bool captureCursor = true;
+    bool captureAudio = false;
 };
 
 class RecorderSession {
@@ -44,6 +46,10 @@ public:
     [[nodiscard]] RecorderState state() const noexcept { return state_.load(); }
     [[nodiscard]] const InMemoryFrameStore& frame_store() const noexcept { return store_; }
     [[nodiscard]] std::wstring last_error() const;
+    const gifler::core::AudioRecording& audio() const { return audio_.recording(); }
+    const std::wstring& audio_error() const { return audio_.error(); }
+    int recorded_fps() const { return recordedFps_; }
+    std::size_t captured_frames() const { return capturedFrames_; }
 
 private:
     void prepare_start(RecorderSettings settings);
@@ -58,6 +64,9 @@ private:
     InMemoryFrameStore store_{};
     mutable std::mutex errorMutex_{};
     std::wstring lastError_{};
+    LoopbackAudio audio_;
+    int recordedFps_ = 10;
+    std::atomic<std::size_t> capturedFrames_ = 0;
 };
 
 } // namespace gifler::record

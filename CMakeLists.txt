@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(GiflerNative
-    VERSION 0.1.0
+    VERSION 0.2.0
     DESCRIPTION "Compact native Windows screen recorder"
     LANGUAGES CXX
 )
@@ -51,6 +51,7 @@ add_library(gifler_win32 STATIC
     src/gifler_win32/Clipboard.cpp
     src/gifler_win32/Dpi.cpp
     src/gifler_win32/Process.cpp
+    src/gifler_win32/ResizeOverlay.cpp
     src/gifler_win32/WindowRegion.cpp
     src/gifler_win32/WicImageWriter.cpp
     src/gifler_win32/Win32Util.cpp
@@ -69,11 +70,13 @@ target_link_libraries(gifler_capture_dxgi
 )
 
 add_library(gifler_record STATIC
+    src/gifler_record/LoopbackAudio.cpp
     src/gifler_record/RecorderSession.cpp
 )
-target_link_libraries(gifler_record PUBLIC gifler_core gifler_capture_dxgi)
+target_link_libraries(gifler_record PUBLIC gifler_core gifler_capture_dxgi PRIVATE ole32 uuid)
 
 add_library(gifler_export STATIC
+    src/gifler_export/AudioWave.cpp
     src/gifler_export/EncoderDiscovery.cpp
     src/gifler_export/GifExportPlanner.cpp
     src/gifler_export/GifRecordingExporter.cpp
@@ -88,6 +91,8 @@ target_link_libraries(gifler_editor PUBLIC gifler_core gifler_win32)
 add_executable(Gifler WIN32
     src/gifler_app/main.cpp
     src/gifler_app/MainWindow.cpp
+    src/gifler_app/MainWindowChrome.cpp
+    src/gifler_app/FpsDialog.cpp
 )
 target_link_libraries(Gifler
     PRIVATE gifler_core gifler_win32 gifler_capture_dxgi gifler_record gifler_export gifler_editor
@@ -134,6 +139,17 @@ if (GIFLER_BUILD_TESTS)
     )
     target_link_libraries(gifler_tests PRIVATE gifler_core gifler_export gifler_record)
     add_test(NAME gifler_tests COMMAND gifler_tests)
+    add_executable(gifler_export_smoke tests/export_smoke.cpp)
+    add_executable(gifler_audio_packet_probe tests/audio_packet_probe.cpp)
+    target_link_libraries(gifler_audio_packet_probe PRIVATE gifler_record ole32 uuid)
+    target_link_libraries(gifler_export_smoke PRIVATE gifler_export)
+    add_executable(gifler_app_smoke tests/app_smoke.cpp src/gifler_app/MainWindow.cpp
+        src/gifler_app/MainWindowChrome.cpp src/gifler_app/FpsDialog.cpp)
+    target_link_libraries(gifler_app_smoke PRIVATE gifler_core gifler_win32 gifler_capture_dxgi
+        gifler_record gifler_export gifler_editor comctl32 comdlg32)
+    if (MSVC)
+        target_link_options(gifler_app_smoke PRIVATE "/MANIFEST:EMBED" "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/src/gifler_app/app.manifest")
+    endif()
 endif()
 
 install(TARGETS Gifler RUNTIME DESTINATION .)

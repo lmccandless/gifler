@@ -1,4 +1,6 @@
 #include "gifler_app/MainWindow.h"
+#include "gifler_app/FpsDialog.h"
+#include "gifler_core/AspectRatio.h"
 
 #include "gifler_editor/EditorWindow.h"
 #include "gifler_win32/Clipboard.h"
@@ -12,12 +14,14 @@
 #include <algorithm>
 #include <cstdint>
 #include <format>
+#include <fstream>
 
 namespace gifler::app {
 namespace {
 
 constexpr wchar_t WindowClassName[] = L"GiflerNativeMainWindow";
 constexpr UINT_PTR PreviewTimerId = 3001;
+constexpr UINT_PTR RecorderTimerId = 3002;
 constexpr UINT SaveProgressMessage = WM_APP + 1;
 constexpr UINT SaveCompleteMessage = WM_APP + 2;
 
@@ -74,7 +78,7 @@ bool MainWindow::create(HINSTANCE instance, int showCommand) {
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     wc.hIconSm = LoadIconW(nullptr, IDI_APPLICATION);
-    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+    wc.hbrBackground = nullptr;
     wc.lpszClassName = WindowClassName;
 
     RegisterClassExW(&wc);
@@ -87,15 +91,20 @@ bool MainWindow::create(HINSTANCE instance, int showCommand) {
     if (hwnd_ == nullptr) {
         return false;
     }
+    SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE);
+    fit_window_aspect();
     ShowWindow(hwnd_, showCommand);
     UpdateWindow(hwnd_);
     apply_capture_or_preview_region();
+    update_resize_overlay();
     return true;
 }
 
 int MainWindow::run_message_loop() {
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (IsDialogMessageW(hwnd_, &msg)) continue;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
@@ -125,6 +134,8 @@ LRESULT MainWindow::window_proc(UINT message, WPARAM wParam, LPARAM lParam) {
         dpi_ = win32::dpi_for_window_or_default(hwnd_);
         gifler::exporting::cleanup_old_clipboard_cache_best_effort(gifler::exporting::default_clipboard_cache_dir());
         create_menu();
+        create_chrome();
+        if (!resizeOverlay_.create(hwnd_)) return -1;
         saveProgress_ = CreateWindowExW(0, PROGRESS_CLASSW, nullptr, WS_CHILD | PBS_SMOOTH, 0, 0, 1, 1, hwnd_, nullptr,
                                         instance_, nullptr);
         SendMessageW(saveProgress_, PBM_SETRANGE32, 0, 100);
@@ -134,32 +145,125 @@ LRESULT MainWindow::window_proc(UINT message, WPARAM wParam, LPARAM lParam) {
     case WM_SIZE:
         layout();
         return 0;
+    case WM_WINDOWPOSCHANGING: {
+        auto& position = *reinterpret_cast<WINDOWPOS*>(lParam);
+        if (settings_.captureAspectRatio && !(position.flags & SWP_NOSIZE) && !IsIconic(hwnd_) && position.cx > 0 && position.cy > 0) {
+            const auto size = gifler::core::aspect_window_size({position.cx, position.cy},
+                gifler::core::CaptureAspectRatios[settings_.captureAspectRatio], capture_chrome_size(),
+                {scaled(120), scaled(65)}, gifler::core::ResizeSide::BottomRight, true);
+            position.cx = size.width;
+            position.cy = size.height;
+        }
+        break;
+    }
     case WM_MOVE:
         update_status_rect_text();
+        update_resize_overlay();
         return 0;
     case WM_DPICHANGED: {
         dpi_ = HIWORD(wParam);
+        refresh_fonts();
         const auto* suggested = reinterpret_cast<RECT*>(lParam);
         SetWindowPos(hwnd_, nullptr, suggested->left, suggested->top, suggested->right - suggested->left,
                      suggested->bottom - suggested->top, SWP_NOZORDER | SWP_NOACTIVATE);
         layout();
+        fit_window_aspect();
         return 0;
+    }
+    case WM_SIZING: {
+        if (!settings_.captureAspectRatio || wParam < WMSZ_LEFT || wParam > WMSZ_BOTTOMRIGHT) break;
+        auto& rect = *reinterpret_cast<RECT*>(lParam);
+        const auto adjusted = gifler::core::constrain_capture_aspect(
+            {rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top},
+            gifler::core::CaptureAspectRatios[settings_.captureAspectRatio], capture_chrome_size(),
+            {scaled(120), scaled(65)}, static_cast<gifler::core::ResizeSide>(wParam));
+        rect = {adjusted.x, adjusted.y, adjusted.right(), adjusted.bottom()};
+        return TRUE;
     }
     case WM_GETMINMAXINFO: {
         auto* info = reinterpret_cast<MINMAXINFO*>(lParam);
         info->ptMinTrackSize.x = scaled(120);
-        info->ptMinTrackSize.y = scaled(90);
+        info->ptMinTrackSize.y = scaled(65);
+        if (settings_.captureAspectRatio) {
+            const auto size = gifler::core::aspect_window_size({scaled(120), scaled(65)},
+                gifler::core::CaptureAspectRatios[settings_.captureAspectRatio], capture_chrome_size(),
+                {scaled(120), scaled(65)}, gifler::core::ResizeSide::BottomRight, true);
+            info->ptMinTrackSize = {size.width, size.height};
+        }
+        MONITORINFO monitor{sizeof(monitor)};
+        if (GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &monitor)) {
+            info->ptMaxPosition = {monitor.rcWork.left - monitor.rcMonitor.left, monitor.rcWork.top - monitor.rcMonitor.top};
+            info->ptMaxSize = {monitor.rcWork.right - monitor.rcWork.left, monitor.rcWork.bottom - monitor.rcWork.top};
+            if (settings_.captureAspectRatio) {
+                const auto size = gifler::core::aspect_window_size({info->ptMaxSize.x, info->ptMaxSize.y},
+                    gifler::core::CaptureAspectRatios[settings_.captureAspectRatio], capture_chrome_size(),
+                    {scaled(120), scaled(65)}, gifler::core::ResizeSide::BottomRight, true);
+                info->ptMaxPosition.x += (info->ptMaxSize.x - size.width) / 2;
+                info->ptMaxPosition.y += (info->ptMaxSize.y - size.height) / 2;
+                info->ptMaxSize = {size.width, size.height};
+            }
+        }
         return 0;
     }
+    case WM_NCCALCSIZE:
+        return 0;
+    case WM_NCPAINT:
+        return 0;
+    case WM_NCACTIVATE:
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return TRUE;
+    case WM_SETTINGCHANGE:
+    case WM_THEMECHANGED:
+        refresh_fonts();
+        InvalidateRect(hwnd_, nullptr, TRUE);
+        refresh_chrome();
+        return 0;
+    case WM_DRAWITEM:
+        draw_button(*reinterpret_cast<DRAWITEMSTRUCT*>(lParam));
+        return TRUE;
     case WM_NCHITTEST:
         return hit_test(lParam);
     case WM_COMMAND: {
         const int id = LOWORD(wParam);
+        if (id == CloseButton) { SendMessageW(hwnd_, WM_CLOSE, 0, 0); return 0; }
+        if (id == MinimizeButton) { ShowWindow(hwnd_, SW_MINIMIZE); return 0; }
+        if (id == MaximizeButton) { ShowWindow(hwnd_, IsZoomed(hwnd_) ? SW_RESTORE : SW_MAXIMIZE); return 0; }
+        if (id == FpsButton) { if (!recording_ && !saving_) show_popup(fpsMenu_, id); return 0; }
+        if (id == FormatButton) { if (!saving_) show_popup(exportMenu_, id); return 0; }
+        if (id == MoreButton) { if (!saving_) show_popup(commandMenu_, id); return 0; }
         if (saving_) {
+            if (id == SaveButton) {
+                cancelExport_ = true;
+                set_status(L"Canceling export...");
+                return 0;
+            }
             set_status(saveProgressLabel_ + L" in progress");
             return 0;
         }
-        if (id == RecButton) {
+        if (id >= AspectFree && id < AspectFree + static_cast<int>(gifler::core::CaptureAspectRatios.size())) {
+            select_aspect_ratio(id - AspectFree);
+            return 0;
+        }
+        if (id == Audio48k || id == Audio441k) {
+            settings_.mp4AudioSampleRate = id == Audio48k ? 48000 : 44100;
+            preparedMediaPath_.clear();
+            save_preferences();
+            update_menu_state();
+            return 0;
+        }
+        if (id == AudioButton && !recording_) {
+            settings_.captureAudio = !settings_.captureAudio;
+            save_preferences();
+            update_menu_state();
+            set_status(settings_.captureAudio ? L"System audio enabled for the next recording" : L"System audio off");
+        } else if (id == TargetNone || id == Target5 || id == Target10 || id == Target20 || id == Target50 || id == Target100) {
+            settings_.target.displayTargetMb = id - TargetNone;
+            settings_.target.internalSafetyTargetMb = settings_.target.displayTargetMb * 0.95;
+            preparedMediaPath_.clear();
+            save_preferences();
+            update_menu_state();
+            set_status(id == TargetNone ? L"Export size: no limit" : std::format(L"Export target: {} MB", id - TargetNone));
+        } else if (id == RecButton) {
             if (recording_) {
                 stop_recording();
             } else {
@@ -170,31 +274,39 @@ LRESULT MainWindow::window_proc(UINT message, WPARAM wParam, LPARAM lParam) {
             save_preferences();
             update_menu_state();
             set_status(captureCursor_ ? L"Cursor capture enabled" : L"Cursor capture disabled");
-        } else if (id == PlayButton) {
+        } else if (id == PlayButton && !recording_) {
             toggle_preview_playback();
         } else if (id == CopyGifButton) {
             copy_media();
         } else if (id == SaveButton) {
             save_recording();
-        } else if (id == EditButton) {
+        } else if (id == EditButton && !recording_) {
             const auto& frames = active_frames();
-            gifler::editor::EditorWindow::show(hwnd_, frames, [this](std::vector<gifler::core::BgraFrame> editedFrames) {
+            const auto revision = recordingRevision_;
+            gifler::editor::EditorWindow::show(hwnd_, frames, [this, revision](std::vector<gifler::core::BgraFrame> editedFrames) {
+                if (revision != recordingRevision_) {
+                    set_status(L"This editor belongs to an earlier recording");
+                    return;
+                }
                 apply_edited_frames(std::move(editedFrames));
             });
             set_status(frames.empty() ? L"No recording to edit | GIF: --" : L"Editor opened");
         } else if (id == FrameButton) {
             set_status(L"Frame menu stub");
-        } else if (id == Fps5 || id == Fps10 || id == Fps15 || id == Fps30) {
-            selectedFps_ = id == Fps5 ? 5 : id == Fps10 ? 10 : id == Fps15 ? 15 : 30;
-            save_preferences();
-            update_menu_state();
-            set_status(std::format(L"FPS set to {} | GIF: --", selectedFps_));
-        } else if (id == ExportGif || id == ExportMp4 || id == ExportWebP || id == ExportWebM) {
-            selectedExportFormat_ = id == ExportGif ? 0 : id == ExportMp4 ? 1 : id == ExportWebP ? 2 : 3;
+        } else if (!recording_ && id == FpsCustom) {
+            const auto fps = prompt_custom_fps(hwnd_, selectedFps_);
+            if (fps) select_fps(*fps);
+        } else if (!recording_ && (id == Fps5 || id == Fps10 || id == Fps15 || id == Fps24 ||
+                   id == Fps30 || id == Fps48 || id == Fps60 || id == Fps120)) {
+            select_fps(id - 1100);
+        } else if (id == ExportGif || id == ExportMp4 || id == ExportSocialMp4 || id == ExportWebP || id == ExportWebM) {
+            selectedExportFormat_ = id == ExportGif ? 0 : (id == ExportMp4 || id == ExportSocialMp4) ? 1 : id == ExportWebP ? 2 : 3;
+            if (selectedExportFormat_ == 1) settings_.socialMp4 = id == ExportSocialMp4;
+            preparedMediaPath_.clear();
             save_preferences();
             update_menu_state();
             set_status(selectedExportFormat_ == 0 ? L"Export format: GIF | GIF: --"
-                                                  : selectedExportFormat_ == 1 ? L"Export format: MP4 | GIF: --"
+                                                  : selectedExportFormat_ == 1 ? (settings_.socialMp4 ? L"Export format: MP4 Social / X" : L"Export format: MP4 | GIF: --")
                                                   : selectedExportFormat_ == 2 ? L"Export format: WebP | GIF: --"
                                                                               : L"Export format: WebM | GIF: --");
         }
@@ -210,6 +322,14 @@ LRESULT MainWindow::window_proc(UINT message, WPARAM wParam, LPARAM lParam) {
         finish_save();
         return 0;
     case WM_TIMER:
+        if (wParam == RecorderTimerId) {
+            if (recording_ && recorder_.state() == gifler::record::RecorderState::Failed) {
+                const auto error = recorder_.last_error();
+                stop_recording();
+                set_status(L"Recording stopped: " + error);
+            }
+            return 0;
+        }
         if (wParam == PreviewTimerId) {
             const auto& frames = active_frames();
             if (!previewMode_ || !previewPlaying_ || frames.empty()) {
@@ -225,21 +345,40 @@ LRESULT MainWindow::window_proc(UINT message, WPARAM wParam, LPARAM lParam) {
     case WM_PAINT:
         paint();
         return 0;
+    case WM_PRINTCLIENT: {
+        RECT client{};
+        GetClientRect(hwnd_, &client);
+        const auto dc = reinterpret_cast<HDC>(wParam);
+        paint_chrome(dc, client);
+        if (previewMode_) paint_preview_frame(dc);
+        return 0;
+    }
     case WM_ERASEBKGND:
         return 1;
+    case WM_CTLCOLORBTN:
+        SetDCBrushColor(reinterpret_cast<HDC>(wParam), highContrast_ ? GetSysColor(COLOR_BTNFACE) : RGB(28, 29, 30));
+        return reinterpret_cast<LRESULT>(GetStockObject(DC_BRUSH));
     case WM_DESTROY:
+        resizeOverlay_.close();
+        cancelExport_ = true;
         KillTimer(hwnd_, PreviewTimerId);
+        KillTimer(hwnd_, RecorderTimerId);
         recorder_.stop();
         win32::clear_window_region(hwnd_);
         if (saveThread_.joinable()) {
             saveThread_.join();
         }
         save_preferences();
+        if (commandMenu_) { DestroyMenu(commandMenu_); commandMenu_ = nullptr; }
+        if (uiFont_) { DeleteObject(uiFont_); uiFont_ = nullptr; }
+        if (titleFont_) { DeleteObject(titleFont_); titleFont_ = nullptr; }
+        if (iconFont_) { DeleteObject(iconFont_); iconFont_ = nullptr; }
         PostQuitMessage(0);
         return 0;
     default:
         return DefWindowProcW(hwnd_, message, wParam, lParam);
     }
+    return DefWindowProcW(hwnd_, message, wParam, lParam);
 }
 
 void MainWindow::save_preferences() {
@@ -250,88 +389,122 @@ void MainWindow::save_preferences() {
 }
 
 void MainWindow::create_menu() {
-    menuBar_ = CreateMenu();
     commandMenu_ = CreatePopupMenu();
     fpsMenu_ = CreatePopupMenu();
     exportMenu_ = CreatePopupMenu();
+    targetMenu_ = CreatePopupMenu();
+    aspectMenu_ = CreatePopupMenu();
+    audioRateMenu_ = CreatePopupMenu();
+    int aspectIndex = 0;
+    for (const auto* label : {L"Free", L"16:9  Landscape", L"9:16  Portrait", L"1:1  Square", L"4:5  Portrait", L"4:3  Landscape", L"3:4  Portrait"})
+        AppendMenuW(aspectMenu_, MF_STRING, AspectFree + aspectIndex++, label);
+    AppendMenuW(audioRateMenu_, MF_STRING, Audio48k, L"48 kHz");
+    AppendMenuW(audioRateMenu_, MF_STRING, Audio441k, L"44.1 kHz");
+    AppendMenuW(targetMenu_, MF_STRING, TargetNone, L"No limit");
+    for (const int mb : {5, 10, 20, 50, 100}) {
+        const auto label = std::format(L"{} MB", mb);
+        AppendMenuW(targetMenu_, MF_STRING, TargetNone + mb, label.c_str());
+    }
 
     AppendMenuW(fpsMenu_, MF_STRING, Fps5, L"5 FPS");
     AppendMenuW(fpsMenu_, MF_STRING, Fps10, L"10 FPS");
     AppendMenuW(fpsMenu_, MF_STRING, Fps15, L"15 FPS");
+    AppendMenuW(fpsMenu_, MF_STRING, Fps24, L"24 FPS");
     AppendMenuW(fpsMenu_, MF_STRING, Fps30, L"30 FPS");
+    AppendMenuW(fpsMenu_, MF_STRING, Fps48, L"48 FPS");
+    AppendMenuW(fpsMenu_, MF_STRING, Fps60, L"60 FPS");
+    AppendMenuW(fpsMenu_, MF_STRING, Fps120, L"120 FPS");
+    AppendMenuW(fpsMenu_, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(fpsMenu_, MF_STRING, FpsCustom, L"Custom...");
 
     AppendMenuW(exportMenu_, MF_STRING, ExportGif, L"GIF");
     AppendMenuW(exportMenu_, MF_STRING, ExportMp4, L"MP4 H.264");
+    AppendMenuW(exportMenu_, MF_STRING, ExportSocialMp4, L"MP4 Social / X");
     AppendMenuW(exportMenu_, MF_STRING, ExportWebP, L"Animated WebP");
     AppendMenuW(exportMenu_, MF_STRING, ExportWebM, L"WebM VP9");
+    AppendMenuW(exportMenu_, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(exportMenu_, MF_POPUP, reinterpret_cast<UINT_PTR>(targetMenu_), L"Size target");
+    AppendMenuW(exportMenu_, MF_POPUP, reinterpret_cast<UINT_PTR>(audioRateMenu_), L"MP4 audio rate");
 
     AppendMenuW(commandMenu_, MF_STRING, PlayButton, L"Play");
     AppendMenuW(commandMenu_, MF_STRING, CursorButton, L"Record Cursor");
+    AppendMenuW(commandMenu_, MF_STRING, AudioButton, L"Record system audio");
+    AppendMenuW(commandMenu_, MF_POPUP, reinterpret_cast<UINT_PTR>(aspectMenu_), L"Capture aspect ratio");
     AppendMenuW(commandMenu_, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(commandMenu_, MF_STRING, FrameButton, L"Frame");
     AppendMenuW(commandMenu_, MF_STRING, EditButton, L"Edit");
-
-    AppendMenuW(menuBar_, MF_STRING, RecButton, L"Rec");
-    AppendMenuW(menuBar_, MF_POPUP, reinterpret_cast<UINT_PTR>(fpsMenu_), L"FPS");
-    AppendMenuW(menuBar_, MF_STRING, CopyGifButton, L"Copy");
-    exportMenuPosition_ = GetMenuItemCount(menuBar_);
-    AppendMenuW(menuBar_, MF_POPUP, reinterpret_cast<UINT_PTR>(exportMenu_), L"GIF");
-    AppendMenuW(menuBar_, MF_STRING, SaveButton, L"Save");
-    AppendMenuW(menuBar_, MF_POPUP, reinterpret_cast<UINT_PTR>(commandMenu_), L"More");
-    SetMenu(hwnd_, menuBar_);
+    AppendMenuW(commandMenu_, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(commandMenu_, MF_POPUP, reinterpret_cast<UINT_PTR>(fpsMenu_), L"Frame rate");
+    AppendMenuW(commandMenu_, MF_POPUP, reinterpret_cast<UINT_PTR>(exportMenu_), L"Export format");
+    AppendMenuW(commandMenu_, MF_STRING, CopyGifButton, L"Copy recording");
+    AppendMenuW(commandMenu_, MF_STRING, SaveButton, L"Save recording...");
     update_menu_state();
 }
 
 void MainWindow::update_menu_state() {
-    if (menuBar_ == nullptr || commandMenu_ == nullptr) {
+    if (commandMenu_ == nullptr) {
         return;
     }
-    ModifyMenuW(menuBar_, RecButton, MF_BYCOMMAND | MF_STRING, RecButton, recording_ ? L"Stop" : L"Rec");
     ModifyMenuW(commandMenu_, PlayButton, MF_BYCOMMAND | MF_STRING, PlayButton, previewPlaying_ ? L"Pause" : L"Play");
     CheckMenuItem(commandMenu_, CursorButton, MF_BYCOMMAND | (captureCursor_ ? MF_CHECKED : MF_UNCHECKED));
     const UINT enabled = saving_ ? MF_GRAYED : MF_ENABLED;
-    EnableMenuItem(menuBar_, RecButton, MF_BYCOMMAND | enabled);
-    EnableMenuItem(menuBar_, CopyGifButton, MF_BYCOMMAND | enabled);
-    EnableMenuItem(menuBar_, SaveButton, MF_BYCOMMAND | ((saving_ || recording_) ? MF_GRAYED : MF_ENABLED));
-    EnableMenuItem(commandMenu_, PlayButton, MF_BYCOMMAND | enabled);
+    CheckMenuRadioItem(aspectMenu_, AspectFree, AspectFree + 6, AspectFree + settings_.captureAspectRatio, MF_BYCOMMAND);
+    for (int i = 0; i < static_cast<int>(gifler::core::CaptureAspectRatios.size()); ++i)
+        EnableMenuItem(aspectMenu_, AspectFree + i, MF_BYCOMMAND | ((saving_ || recording_) ? MF_GRAYED : MF_ENABLED));
+    CheckMenuRadioItem(audioRateMenu_, Audio48k, Audio441k,
+        settings_.mp4AudioSampleRate == 44100 ? Audio441k : Audio48k, MF_BYCOMMAND);
+    CheckMenuItem(commandMenu_, AudioButton, MF_BYCOMMAND | (settings_.captureAudio ? MF_CHECKED : MF_UNCHECKED));
+    EnableMenuItem(commandMenu_, AudioButton, MF_BYCOMMAND | ((saving_ || recording_) ? MF_GRAYED : MF_ENABLED));
+    for (const int mb : {0, 5, 10, 20, 50, 100}) {
+        CheckMenuItem(targetMenu_, TargetNone + mb, MF_BYCOMMAND |
+            (settings_.target.displayTargetMb == mb ? MF_CHECKED : MF_UNCHECKED));
+    }
+    const bool hasFrames = !recording_ && !active_frames().empty();
+    EnableMenuItem(commandMenu_, CopyGifButton, MF_BYCOMMAND | ((!saving_ && hasFrames) ? MF_ENABLED : MF_GRAYED));
+    ModifyMenuW(commandMenu_, SaveButton, MF_BYCOMMAND | MF_STRING, SaveButton, saving_ ? L"Cancel export" : L"Save recording...");
+    EnableMenuItem(commandMenu_, SaveButton, MF_BYCOMMAND | ((saving_ || hasFrames) ? MF_ENABLED : MF_GRAYED));
+    EnableMenuItem(commandMenu_, PlayButton, MF_BYCOMMAND | ((saving_ || recording_) ? MF_GRAYED : MF_ENABLED));
     EnableMenuItem(commandMenu_, CursorButton, MF_BYCOMMAND | enabled);
     EnableMenuItem(commandMenu_, FrameButton, MF_BYCOMMAND | enabled);
-    EnableMenuItem(commandMenu_, EditButton, MF_BYCOMMAND | enabled);
+    EnableMenuItem(commandMenu_, EditButton, MF_BYCOMMAND | ((saving_ || recording_) ? MF_GRAYED : MF_ENABLED));
 
     if (fpsMenu_ != nullptr) {
-        CheckMenuItem(fpsMenu_, Fps5, MF_BYCOMMAND | (selectedFps_ == 5 ? MF_CHECKED : MF_UNCHECKED));
-        CheckMenuItem(fpsMenu_, Fps10, MF_BYCOMMAND | (selectedFps_ == 10 ? MF_CHECKED : MF_UNCHECKED));
-        CheckMenuItem(fpsMenu_, Fps15, MF_BYCOMMAND | (selectedFps_ == 15 ? MF_CHECKED : MF_UNCHECKED));
-        CheckMenuItem(fpsMenu_, Fps30, MF_BYCOMMAND | (selectedFps_ == 30 ? MF_CHECKED : MF_UNCHECKED));
-        EnableMenuItem(fpsMenu_, Fps5, MF_BYCOMMAND | enabled);
-        EnableMenuItem(fpsMenu_, Fps10, MF_BYCOMMAND | enabled);
-        EnableMenuItem(fpsMenu_, Fps15, MF_BYCOMMAND | enabled);
-        EnableMenuItem(fpsMenu_, Fps30, MF_BYCOMMAND | enabled);
+        const UINT fpsEnabled = (saving_ || recording_) ? MF_GRAYED : MF_ENABLED;
+        bool preset = false;
+        for (const int fps : {5, 10, 15, 24, 30, 48, 60, 120}) {
+            CheckMenuItem(fpsMenu_, 1100 + fps, MF_BYCOMMAND | (selectedFps_ == fps ? MF_CHECKED : MF_UNCHECKED));
+            EnableMenuItem(fpsMenu_, 1100 + fps, MF_BYCOMMAND | fpsEnabled);
+            preset = preset || selectedFps_ == fps;
+        }
+        const auto customLabel = preset ? std::wstring(L"Custom...") : std::format(L"Custom... ({} FPS)", selectedFps_);
+        ModifyMenuW(fpsMenu_, FpsCustom, MF_BYCOMMAND | MF_STRING | (preset ? MF_UNCHECKED : MF_CHECKED), FpsCustom, customLabel.c_str());
+        EnableMenuItem(fpsMenu_, FpsCustom, MF_BYCOMMAND | fpsEnabled);
     }
 
     if (exportMenu_ != nullptr) {
         CheckMenuItem(exportMenu_, ExportGif, MF_BYCOMMAND | (selectedExportFormat_ == 0 ? MF_CHECKED : MF_UNCHECKED));
-        CheckMenuItem(exportMenu_, ExportMp4, MF_BYCOMMAND | (selectedExportFormat_ == 1 ? MF_CHECKED : MF_UNCHECKED));
+        CheckMenuItem(exportMenu_, ExportMp4, MF_BYCOMMAND | (selectedExportFormat_ == 1 && !settings_.socialMp4 ? MF_CHECKED : MF_UNCHECKED));
+        CheckMenuItem(exportMenu_, ExportSocialMp4, MF_BYCOMMAND | (selectedExportFormat_ == 1 && settings_.socialMp4 ? MF_CHECKED : MF_UNCHECKED));
         CheckMenuItem(exportMenu_, ExportWebP, MF_BYCOMMAND | (selectedExportFormat_ == 2 ? MF_CHECKED : MF_UNCHECKED));
         CheckMenuItem(exportMenu_, ExportWebM, MF_BYCOMMAND | (selectedExportFormat_ == 3 ? MF_CHECKED : MF_UNCHECKED));
         EnableMenuItem(exportMenu_, ExportGif, MF_BYCOMMAND | enabled);
         EnableMenuItem(exportMenu_, ExportMp4, MF_BYCOMMAND | enabled);
+        EnableMenuItem(exportMenu_, ExportSocialMp4, MF_BYCOMMAND | enabled);
         EnableMenuItem(exportMenu_, ExportWebP, MF_BYCOMMAND | enabled);
         EnableMenuItem(exportMenu_, ExportWebM, MF_BYCOMMAND | enabled);
+        EnableMenuItem(audioRateMenu_, Audio48k, MF_BYCOMMAND | enabled);
+        EnableMenuItem(audioRateMenu_, Audio441k, MF_BYCOMMAND | enabled);
 
-        const wchar_t* formatLabel = selectedExportFormat_ == 0 ? L"GIF"
-                                     : selectedExportFormat_ == 1 ? L"MP4"
-                                     : selectedExportFormat_ == 2 ? L"WebP"
-                                                                  : L"WebM";
-        ModifyMenuW(menuBar_, exportMenuPosition_, MF_BYPOSITION | MF_POPUP | MF_STRING,
-                    reinterpret_cast<UINT_PTR>(exportMenu_), formatLabel);
     }
-    DrawMenuBar(hwnd_);
+    refresh_chrome();
 }
 
 void MainWindow::update_window_title() {
     const std::wstring title = statusText_.empty() ? L"Gifler" : L"Gifler - " + statusText_;
     SetWindowTextW(hwnd_, title.c_str());
+    RECT client{};
+    GetClientRect(hwnd_, &client);
+    RECT header{0, 0, client.right, scaled(34)};
+    InvalidateRect(hwnd_, &header, FALSE);
 }
 
 gifler::core::PixelRect MainWindow::viewfinder_client_rect() const {
@@ -352,28 +525,61 @@ int MainWindow::scaled(int value) const {
     return win32::scale_for_dpi(value, dpi_);
 }
 
+gifler::core::PixelSize MainWindow::capture_chrome_size() const {
+    return {scaled(3) + scaled(10), scaled(34) + scaled(10)};
+}
+
+void MainWindow::fit_window_aspect() {
+    if (!hwnd_ || !settings_.captureAspectRatio) return;
+    RECT rect{};
+    GetWindowRect(hwnd_, &rect);
+    const auto size = gifler::core::aspect_window_size({rect.right - rect.left, rect.bottom - rect.top},
+        gifler::core::CaptureAspectRatios[settings_.captureAspectRatio], capture_chrome_size(),
+        {scaled(120), scaled(65)}, gifler::core::ResizeSide::BottomRight, true);
+    SetWindowPos(hwnd_, nullptr, 0, 0, size.width, size.height, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+void MainWindow::select_aspect_ratio(int index) {
+    if (recording_ || saving_ || index < 0 || index >= static_cast<int>(gifler::core::CaptureAspectRatios.size())) return;
+    if (IsZoomed(hwnd_)) ShowWindow(hwnd_, SW_RESTORE);
+    settings_.captureAspectRatio = index;
+    fit_window_aspect();
+    save_preferences();
+    update_menu_state();
+    const auto ratio = gifler::core::CaptureAspectRatios[index];
+    set_status(index ? std::format(L"Capture ratio locked to {}:{}", ratio.width, ratio.height) : L"Ready");
+}
+
 void MainWindow::layout() {
     RECT client{};
     GetClientRect(hwnd_, &client);
     const int width = client.right - client.left;
     const int height = client.bottom - client.top;
 
-    const int grip = scaled(10);
+    layout_chrome(width, height);
+    const int grip = scaled(3);
     const int inset = (width > grip * 2 && height > grip * 2) ? grip : 0;
     if (saveProgress_ != nullptr) {
-        const int progressHeight = scaled(16);
-        MoveWindow(saveProgress_, inset, std::max(inset, height - inset - progressHeight),
+        const int progressHeight = scaled(2);
+        MoveWindow(saveProgress_, inset, scaled(31),
                    std::max(1, width - inset * 2), progressHeight, TRUE);
     }
     {
         std::lock_guard lock(geometryMutex_);
-        viewfinderClientRect_ = {inset, inset, std::max(1, width - inset * 2), std::max(1, height - inset * 2)};
+        viewfinderClientRect_ = {inset, scaled(34), std::max(1, width - inset - scaled(10)),
+                                std::max(1, height - scaled(34) - scaled(10))};
         captureRectScreen_ = win32::client_rect_to_screen_pixels(hwnd_, viewfinderClientRect_);
     }
 
     update_status_rect_text();
     apply_capture_or_preview_region();
-    InvalidateRect(hwnd_, nullptr, TRUE);
+    update_resize_overlay();
+    RedrawWindow(hwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_NOERASE);
+}
+
+void MainWindow::update_resize_overlay() {
+    resizeOverlay_.update(current_capture_rect(), scaled(12), scaled(26),
+        IsWindowVisible(hwnd_) && !IsIconic(hwnd_) && !IsZoomed(hwnd_));
 }
 
 void MainWindow::paint() {
@@ -383,8 +589,7 @@ void MainWindow::paint() {
     RECT client{};
     GetClientRect(hwnd_, &client);
 
-    HBRUSH faceBrush = GetSysColorBrush(COLOR_BTNFACE);
-    FillRect(dc, &client, faceBrush);
+    paint_chrome(dc, client);
 
     const auto viewfinder = viewfinder_client_rect();
     RECT vf{viewfinder.left(), viewfinder.top(), viewfinder.right(), viewfinder.bottom()};
@@ -397,13 +602,18 @@ void MainWindow::paint() {
 }
 
 void MainWindow::apply_capture_or_preview_region() {
-    if (hwnd_ == nullptr) {
+    if (hwnd_ == nullptr || applyingRegion_) {
         return;
     }
 
+    const auto hole = previewMode_ ? std::optional<gifler::core::PixelRect>{} : std::make_optional(viewfinder_client_rect());
+    if (hole == appliedHole_) return;
+    applyingRegion_ = true;
     std::wstring error;
     const bool applied = previewMode_ ? win32::clear_window_region(hwnd_, &error)
                                       : win32::apply_viewfinder_hole_region(hwnd_, viewfinder_client_rect(), &error);
+    applyingRegion_ = false;
+    if (applied) appliedHole_ = hole;
     if (!applied && !error.empty()) {
         statusText_ = L"Viewfinder error: " + error;
         update_window_title();
@@ -428,6 +638,7 @@ void MainWindow::set_status(std::wstring text) {
 }
 
 void MainWindow::start_recording() {
+    ++recordingRevision_;
     KillTimer(hwnd_, PreviewTimerId);
     previewMode_ = false;
     previewPlaying_ = false;
@@ -443,15 +654,25 @@ void MainWindow::start_recording() {
     settings.fps = selected_fps();
     settings.queueCapacity = 8;
     settings.captureCursor = captureCursor_;
+    settings.captureAudio = settings_.captureAudio;
 
     const auto captureRect = current_capture_rect();
-    recorder_.start_dxgi(settings, [this] { return capture_rect_snapshot(); });
+    try {
+        recorder_.start_dxgi(settings, [this] { return capture_rect_snapshot(); });
+    } catch (...) {
+        recording_ = false;
+        update_menu_state();
+        set_status(L"Could not allocate recording resources.");
+        return;
+    }
+    SetTimer(hwnd_, RecorderTimerId, 250, nullptr);
     apply_capture_or_preview_region();
     set_status(std::format(L"Recording {}x{} @ {},{} target {} FPS | GIF: --", captureRect.width, captureRect.height,
                            captureRect.x, captureRect.y, settings.fps));
 }
 
 void MainWindow::stop_recording() {
+    KillTimer(hwnd_, RecorderTimerId);
     recorder_.stop();
     recording_ = false;
     update_menu_state();
@@ -475,6 +696,10 @@ void MainWindow::stop_recording() {
     const double seconds = static_cast<double>(recorder_.frame_store().total_duration_ticks()) / 10'000'000.0;
     set_status(std::format(L"Stopped | preview ready: {} frames, {:.2f}s, {:.2f} MB raw | GIF: --", frames.size(), seconds,
                            static_cast<double>(recorder_.frame_store().total_pixel_bytes()) / (1024.0 * 1024.0)));
+    if (!recorder_.audio_error().empty()) set_status(statusText_ + L" | " + recorder_.audio_error());
+    else if (seconds > 0) set_status(std::format(L"Stopped | {:.2f}s | {:.1f} FPS captured | {} frames | {}",
+        seconds, recorder_.captured_frames() / seconds, frames.size(),
+        recorder_.audio().sampleRate ? L"System audio" : L"Silent"));
 }
 
 void MainWindow::toggle_preview_playback() {
@@ -534,12 +759,15 @@ void MainWindow::start_export(std::filesystem::path outputPath, bool copyOperati
         saveThread_.join();
     }
 
+    try {
     const int exportFormat = selectedExportFormat_;
     const bool gif = exportFormat == 0;
     const auto* framesToSave = &frames;
     const std::size_t frameCount = frames.size();
+    cancelExport_ = false;
     saveProgressLabel_ = (copyOperation ? L"Copying " : L"Saving ") + media_format_name(exportFormat);
     saving_ = true;
+    layout();
     SendMessageW(saveProgress_, PBM_SETPOS, 0, 0);
     ShowWindow(saveProgress_, SW_SHOWNA);
     BringWindowToTop(saveProgress_);
@@ -550,11 +778,23 @@ void MainWindow::start_export(std::filesystem::path outputPath, bool copyOperati
     const HWND progressWindow = hwnd_;
     if (gif) {
         auto request = make_gif_request(outputPath);
+        request.canceled = [this] { return cancelExport_.load(); };
+        gifler::exporting::TargetSizeOptions target{};
+        target.enabled = settings_.target.displayTargetMb > 0;
+        target.displayTargetMb = settings_.target.displayTargetMb;
+        target.internalSafetyTargetMb = settings_.target.internalSafetyTargetMb;
         request.progress = [progressWindow](int value) { PostMessageW(progressWindow, SaveProgressMessage, value, 0); };
         saveThread_ = std::thread([this, framesToSave, frameCount, exportFormat, copyOperation,
-                                   request = std::move(request)]() mutable {
-            auto summary = gifler::exporting::export_gif_from_frames(*framesToSave, std::move(request),
-                                                                     gifler::exporting::TargetSizeOptions{});
+                                   target, request = std::move(request)]() mutable {
+            gifler::exporting::GifExportSummary summary{};
+            try {
+                summary = gifler::exporting::export_gif_from_frames(*framesToSave, std::move(request), target);
+            } catch (const std::exception& error) {
+                const std::string text = error.what();
+                summary.message = L"Export failed: " + std::wstring(text.begin(), text.end());
+            } catch (...) {
+                summary.message = L"Export failed unexpectedly. The recording is still available.";
+            }
             {
                 std::lock_guard lock(saveResultMutex_);
                 saveResultSuccess_ = summary.success;
@@ -568,10 +808,19 @@ void MainWindow::start_export(std::filesystem::path outputPath, bool copyOperati
         });
     } else {
         auto request = make_video_request(outputPath);
+        request.canceled = [this] { return cancelExport_.load(); };
         request.progress = [progressWindow](int value) { PostMessageW(progressWindow, SaveProgressMessage, value, 0); };
         saveThread_ = std::thread([this, framesToSave, frameCount, exportFormat, copyOperation,
                                    request = std::move(request)]() mutable {
-            auto summary = gifler::exporting::export_video_from_frames(*framesToSave, std::move(request));
+            gifler::exporting::VideoExportSummary summary{};
+            try {
+                summary = gifler::exporting::export_video_from_frames(*framesToSave, std::move(request));
+            } catch (const std::exception& error) {
+                const std::string text = error.what();
+                summary.message = L"Export failed: " + std::wstring(text.begin(), text.end());
+            } catch (...) {
+                summary.message = L"Export failed unexpectedly. The recording is still available.";
+            }
             {
                 std::lock_guard lock(saveResultMutex_);
                 saveResultSuccess_ = summary.success;
@@ -583,6 +832,13 @@ void MainWindow::start_export(std::filesystem::path outputPath, bool copyOperati
             }
             PostMessageW(hwnd_, SaveCompleteMessage, 0, 0);
         });
+    }
+    } catch (...) {
+        saving_ = false;
+        ShowWindow(saveProgress_, SW_HIDE);
+        layout();
+        update_menu_state();
+        set_status(L"Could not start export. The recording is still available; retry or choose a smaller recording.");
     }
 }
 
@@ -608,6 +864,7 @@ void MainWindow::finish_save() {
     }
 
     saving_ = false;
+    layout();
     ShowWindow(saveProgress_, SW_HIDE);
     update_menu_state();
     if (success) {
@@ -617,6 +874,10 @@ void MainWindow::finish_save() {
     }
 
     const auto formatName = media_format_name(exportFormat);
+    if (!success && cancelExport_) {
+        set_status(L"Export canceled | Recording retained");
+        return;
+    }
     if (success && copyOperation) {
         std::wstring clipboardError;
         if (!gifler::win32::set_clipboard_file_drop(hwnd_, outputPath, &clipboardError)) {
@@ -634,6 +895,11 @@ void MainWindow::finish_save() {
 
     if (!success) {
         const auto failure = (copyOperation ? L"Copy " : L"Save ") + formatName + L" failed | " + message;
+        try {
+            const auto path = gifler::exporting::default_temp_root().parent_path() / L"last-export-error.txt";
+            std::wofstream log(path, std::ios::trunc);
+            log << failure;
+        } catch (...) {}
         set_status(failure);
         MessageBoxW(hwnd_, failure.c_str(), copyOperation ? L"Gifler Copy Failed" : L"Gifler Save Failed",
                     MB_OK | MB_ICONERROR);
@@ -680,6 +946,10 @@ void MainWindow::copy_media() {
 }
 
 void MainWindow::apply_edited_frames(std::vector<gifler::core::BgraFrame> frames) {
+    if (saving_ || recording_) {
+        set_status(L"Finish the current operation before applying edits");
+        return;
+    }
     if (frames.empty()) {
         set_status(L"Edit produced no frames | GIF: --");
         return;
@@ -764,7 +1034,7 @@ gifler::exporting::GifExportRequest MainWindow::make_gif_request(std::filesystem
 
     gifler::exporting::GifExportRequest request{};
     request.outputPath = std::move(outputPath);
-    request.requestedFps = selected_fps();
+    request.requestedFps = recorder_.recorded_fps();
     request.ffmpegPath = encoders.ffmpeg;
     request.gifskiPath = encoders.gifski;
     request.gifsiclePath = encoders.gifsicle;
@@ -778,10 +1048,13 @@ gifler::exporting::VideoExportRequest MainWindow::make_video_request(std::filesy
     gifler::exporting::VideoExportRequest request{};
     request.format = selected_video_format();
     request.outputPath = std::move(outputPath);
-    request.requestedFps = selected_fps();
+    request.requestedFps = recorder_.recorded_fps();
     request.ffmpegPath = encoders.ffmpeg;
-    request.targetMb = 10.0;
+    request.targetMb = settings_.target.displayTargetMb;
+    if (recorder_.audio().sampleRate) request.audio = &recorder_.audio();
     request.quality = 75;
+    request.socialCompatibility = settings_.socialMp4;
+    request.audioSampleRate = settings_.mp4AudioSampleRate;
     return request;
 }
 
@@ -845,11 +1118,6 @@ int MainWindow::selected_fps() const {
 }
 
 LRESULT MainWindow::hit_test(LPARAM lParam) const {
-    const LRESULT defaultHit = DefWindowProcW(hwnd_, WM_NCHITTEST, 0, lParam);
-    if (defaultHit != HTCLIENT) {
-        return defaultHit;
-    }
-
     POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
     ScreenToClient(hwnd_, &point);
 
@@ -857,12 +1125,15 @@ LRESULT MainWindow::hit_test(LPARAM lParam) const {
     GetClientRect(hwnd_, &client);
     const int width = client.right - client.left;
     const int height = client.bottom - client.top;
-    const int grip = scaled(12);
+    const int grip = IsZoomed(hwnd_) ? 0 : scaled(3);
 
     const bool left = point.x >= 0 && point.x < grip;
-    const bool right = point.x >= width - grip && point.x < width;
+    const int easyGrip = IsZoomed(hwnd_) ? 0 : scaled(10);
+    const bool right = point.x >= width - easyGrip && point.x < width;
     const bool top = point.y >= 0 && point.y < grip;
-    const bool bottom = point.y >= height - grip && point.y < height;
+    const bool bottom = point.y >= height - easyGrip && point.y < height;
+
+    if ((right || bottom) && point.x >= width - scaled(22) && point.y >= height - scaled(22)) return HTBOTTOMRIGHT;
 
     if (top && left) {
         return HTTOPLEFT;
@@ -889,6 +1160,7 @@ LRESULT MainWindow::hit_test(LPARAM lParam) const {
         return HTBOTTOM;
     }
 
+    if (point.y < scaled(31)) return HTCAPTION;
     return HTCLIENT;
 }
 

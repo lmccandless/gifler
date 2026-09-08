@@ -1,10 +1,15 @@
 #include "gifler_core/FrameDiffer.h"
 #include "gifler_core/Geometry.h"
+#include "gifler_core/AspectRatio.h"
 #include "gifler_core/Settings.h"
+#include "gifler_core/FrameTiming.h"
+#include "gifler_export/AudioWave.h"
 #include "gifler_export/GifExportPlanner.h"
 #include "gifler_export/GifRecordingExporter.h"
 #include "gifler_editor/EditorModel.h"
 #include "gifler_record/BoundedFrameQueue.h"
+#include "gifler_record/AudioPacketTimeline.h"
+#include "gifler_win32/ResizeOverlay.h"
 #include "gifler_record/DuplicateFrameCoalescer.h"
 #include "gifler_record/InMemoryFrameStore.h"
 #include "gifler_record/RecorderSession.h"
@@ -12,6 +17,11 @@
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
+#include <fstream>
+#include <numeric>
+#include <cstring>
+#include <Windows.h>
+#include <mmreg.h>
 #include <string>
 #include <thread>
 #include <vector>
@@ -48,12 +58,28 @@ gifler::core::BgraFrame make_timed_frame(int width, int height, unsigned char va
 void geometry_tests() {
     using namespace gifler::core;
     PixelRect a{10, 10, 100, 100};
-    PixelRect b{50, 70, 100, 100};
-    auto i = intersection(a, b);
+    PixelRect other{50, 70, 100, 100};
+    auto i = intersection(a, other);
     check(i == PixelRect{50, 70, 60, 40}, "intersection should be exact");
     check(contains(a, PixelPoint{10, 10}), "contains top-left");
     check(!contains(a, PixelPoint{110, 110}), "contains excludes bottom-right edge");
     check(scale_for_dpi(96, 144) == 144, "DPI scale 150%");
+    const auto hit = gifler::win32::ResizeOverlay::hit;
+    for (const auto scale : {1, 2}) {
+        const int w = 600 * scale, h = 400 * scale, b = 12 * scale, c = 26 * scale;
+        check(hit({2, 2}, w, h, b, c) == HTTOPLEFT, "inner top-left resize zone");
+        check(hit({w - 2, 2}, w, h, b, c) == HTTOPRIGHT, "inner top-right resize zone");
+        check(hit({2, h - 2}, w, h, b, c) == HTBOTTOMLEFT, "inner bottom-left resize zone");
+        check(hit({w - 2, h - 2}, w, h, b, c) == HTBOTTOMRIGHT, "inner bottom-right resize zone");
+        check(hit({w / 2, 2}, w, h, b, c) == HTTOP, "inner top resize zone");
+        check(hit({w / 2, h - 2}, w, h, b, c) == HTBOTTOM, "inner bottom resize zone");
+        check(hit({2, h / 2}, w, h, b, c) == HTLEFT, "inner left resize zone");
+        check(hit({w - 2, h / 2}, w, h, b, c) == HTRIGHT, "inner right resize zone");
+        check(hit({w / 2, h / 2}, w, h, b, c) == HTNOWHERE, "viewfinder center remains click-through");
+        check(hit({b, c + 1}, w, h, b, c) == HTNOWHERE, "inner edge boundary is exclusive");
+        check(hit({-1, 0}, w, h, b, c) == HTNOWHERE, "negative coordinates excluded");
+    }
+    check(hit({5, 5}, 12, 12, 12, 26) == HTNOWHERE, "small viewfinder keeps center open");
 }
 
 void frame_differ_tests() {
@@ -91,10 +117,50 @@ void planner_tests() {
     check(!plan.attempts.empty(), "planner should fall back to ffmpeg");
     check(plan.attempts.front().engine == gifler::exporting::GifEngine::FfmpegPalette, "ffmpeg fallback first when gifski missing");
 
+    req.requestedFps = 1;
+    plan = gifler::exporting::plan_gif_attempts(req, target);
+    check(!plan.attempts.empty() && plan.attempts.front().fps == 1, "custom 1 FPS remains exportable below the default minimum");
+    req.requestedFps = 60;
+    plan = gifler::exporting::plan_gif_attempts(req, target);
+    check(!plan.attempts.empty() && plan.attempts.front().fps == 60, "GIF planner starts at selected 60 FPS");
+
     req.ffmpegPath.reset();
     plan = gifler::exporting::plan_gif_attempts(req, target);
     check(plan.attempts.empty(), "planner should have no attempts without encoders");
     check(!plan.warning.empty(), "planner should warn without encoders");
+}
+
+void aspect_ratio_tests() {
+    using namespace gifler::core;
+    for (unsigned dpi : {96u, 120u, 144u, 192u}) {
+        const PixelSize chrome{scale_for_dpi(3, dpi) + scale_for_dpi(10, dpi), scale_for_dpi(34, dpi) + scale_for_dpi(10, dpi)};
+        const PixelSize minimum{scale_for_dpi(120, dpi), scale_for_dpi(65, dpi)};
+        for (const auto ratio : CaptureAspectRatios) {
+            const PixelRect proposed{-1500, -500, 573, 379};
+            for (int edge = 1; edge <= 8; ++edge) {
+                const auto side = static_cast<ResizeSide>(edge);
+                const auto rect = constrain_capture_aspect(proposed, ratio, chrome, minimum, side);
+                if (ratio.empty()) { check(rect == proposed, "free aspect does not constrain resizing"); continue; }
+                check((rect.width - chrome.width) * ratio.height == (rect.height - chrome.height) * ratio.width,
+                      "all sizing directions preserve the exact capture aspect, excluding chrome");
+                check(rect.width >= minimum.width && rect.height >= minimum.height, "ratio respects minimum window size");
+                if (side == ResizeSide::Left || side == ResizeSide::TopLeft || side == ResizeSide::BottomLeft)
+                    check(rect.right() == proposed.right(), "left resize anchors right edge");
+                if (side == ResizeSide::Right || side == ResizeSide::TopRight || side == ResizeSide::BottomRight)
+                    check(rect.left() == proposed.left(), "right resize anchors left edge");
+                if (side == ResizeSide::Top || side == ResizeSide::TopLeft || side == ResizeSide::TopRight)
+                    check(rect.bottom() == proposed.bottom(), "top resize anchors bottom edge");
+                if (side == ResizeSide::Bottom || side == ResizeSide::BottomLeft || side == ResizeSide::BottomRight)
+                    check(rect.top() == proposed.top(), "bottom resize anchors top edge");
+                const auto small = constrain_capture_aspect({0, 0, 2, 2}, ratio, chrome, minimum, side);
+                check(small.width >= minimum.width && small.height >= minimum.height, "shrinking never collapses a ratio-locked window");
+            }
+            if (!ratio.empty()) {
+                const auto fit = aspect_window_size({1600, 900}, ratio, chrome, minimum, ResizeSide::BottomRight, true);
+                check(fit.width <= 1600 && fit.height <= 900, "ratio fits within monitor/workspace bounds");
+            }
+        }
+    }
 }
 
 void settings_tests() {
@@ -105,18 +171,41 @@ void settings_tests() {
     gifler::core::AppSettings saved{};
     saved.defaultFps = 30;
     saved.lastExportFormat = 3;
+    saved.captureAudio = true;
+    saved.captureAspectRatio = 2;
+    saved.socialMp4 = true;
+    saved.mp4AudioSampleRate = 44100;
+    saved.target.displayTargetMb = 20;
     gifler::core::save_settings_best_effort(path, saved);
 
     const auto loaded = gifler::core::load_settings_or_defaults(path);
     check(loaded.defaultFps == 30, "settings preserve selected FPS");
     check(loaded.lastExportFormat == 3, "settings preserve selected export format");
+    check(loaded.captureAudio, "settings preserve system audio selection");
+    check(loaded.captureAspectRatio == 2 && loaded.socialMp4 && loaded.mp4AudioSampleRate == 44100,
+          "settings preserve aspect lock, social profile, and MP4 audio rate");
+    check(loaded.target.displayTargetMb == 20 && loaded.target.internalSafetyTargetMb == 19,
+          "20 MB target restores its matching safety margin");
 
-    saved.defaultFps = 27;
+    for (const int fps : {1, 24, 27, 48, 60, 77, 120, 240}) {
+        saved.defaultFps = fps;
+        gifler::core::save_settings_best_effort(path, saved);
+        check(gifler::core::load_settings_or_defaults(path).defaultFps == fps, "preset and custom FPS persist");
+    }
+    for (const int fps : {-1, 0, 241, 1000}) {
+        saved.defaultFps = fps;
+        gifler::core::save_settings_best_effort(path, saved);
+        check(gifler::core::load_settings_or_defaults(path).defaultFps == 10, "out-of-range FPS rejected");
+    }
+    saved.defaultFps = 241;
     saved.lastExportFormat = 99;
+    saved.captureAspectRatio = 99;
+    saved.mp4AudioSampleRate = 96000;
     gifler::core::save_settings_best_effort(path, saved);
     const auto invalid = gifler::core::load_settings_or_defaults(path);
     check(invalid.defaultFps == 10, "settings reject unsupported FPS values");
     check(invalid.lastExportFormat == 0, "settings reject unsupported export formats");
+    check(invalid.captureAspectRatio == 0 && invalid.mp4AudioSampleRate == 48000, "invalid ratio/rate settings restore safe defaults");
     std::filesystem::remove(path, ec);
 }
 
@@ -143,6 +232,34 @@ void gif_exporter_tests() {
 }
 
 void video_exporter_tests() {
+    using namespace gifler::exporting;
+    const auto option = [](const std::vector<std::wstring>& args, const std::wstring& name) {
+        const auto found = std::find(args.begin(), args.end(), name);
+        return found != args.end() && std::next(found) != args.end() ? *std::next(found) : std::wstring{};
+    };
+    for (const int rate : {44100, 48000}) {
+        const auto args = video_audio_arguments(VideoExportFormat::Mp4H264, rate);
+        check(option(args, L"-ar") == std::to_wstring(rate), "MP4 resamples only at export to the selected rate");
+        check(option(args, L"-profile:a") == L"aac_low" && option(args, L"-ac") == L"2", "MP4 uses AAC-LC stereo");
+    }
+    check(option(video_audio_arguments(VideoExportFormat::WebMVP9, 44100), L"-ar") == L"48000", "WebM retains Opus-compatible 48 kHz");
+    check(build_social_video_filter({1920, 1080}).find(L"scale=1280:720:") != std::wstring::npos, "social landscape fits 720p");
+    check(build_social_video_filter({1080, 1920}).find(L"scale=720:1280:") != std::wstring::npos, "social portrait fits 720p");
+    check(build_social_video_filter({1000, 1000}).find(L"scale=720:720:") != std::wstring::npos, "social square fits 720 pixels");
+    check(build_social_video_filter({1000, 100}).find(L"pad=1000:420:") != std::wstring::npos, "social extreme aspect is padded without cropping");
+    check(build_social_video_filter({10, 10}).find(L"pad=32:32:") != std::wstring::npos, "social tiny clips meet minimum dimensions");
+    check(build_social_video_filter({320, 180}).find(L"scale=320:180:") != std::wstring::npos, "social profile does not upscale normal clips");
+    check(build_social_video_filter({320, 180}).find(L"setsar=1") != std::wstring::npos, "social profile guarantees square pixels");
+    check(build_social_video_filter({528, 297}).find(L"scale=512:288:") != std::wstring::npos, "social export preserves exact locked ratio when making dimensions even");
+    std::vector<gifler::core::BgraFrame> jitter;
+    for (int i = 0; i < 200; ++i) jitter.push_back(make_timed_frame(2, 2, 0, 500'000));
+    auto repeats = gifler::core::frame_repeats(jitter, 30);
+    check(std::accumulate(repeats.begin(), repeats.end(), std::size_t{}) == 300,
+          "200 samples spanning 10 seconds produce exactly 300 frames at 30 FPS");
+    jitter.assign(1000, make_timed_frame(2, 2, 0, 10'000));
+    repeats = gifler::core::frame_repeats(jitter, 30);
+    check(std::accumulate(repeats.begin(), repeats.end(), std::size_t{}) == 30,
+          "sub-frame durations do not stretch the recording");
     const int bitrate = gifler::exporting::calculate_h264_bitrate_kbps(10'000'000, 10.0);
     check(bitrate > 1000, "H.264 bitrate calculation uses target size and duration");
 
@@ -275,10 +392,90 @@ void recorder_session_tests() {
     check(session.frame_store().total_pixel_bytes() > 0, "synthetic recorder stores pixel data");
 }
 
+void audio_packet_timeline_tests() {
+    for (const auto rate : {44100, 48000}) {
+        gifler::record::AudioPacketTimeline timeline;
+        const auto frames = static_cast<std::uint32_t>(rate / 100);
+        const auto initial = rate / 4;
+        for (std::uint32_t i = 0; i < 300; ++i) {
+            const auto expected = initial + static_cast<std::int64_t>(i) * frames;
+            const auto jitter = i == 0 ? 0 : (i % 2 ? 928 : -25);
+            check(timeline.place(7000 + static_cast<std::uint64_t>(i) * frames, frames,
+                                 expected + jitter, true) == expected,
+                  "audio remains sample-continuous despite QPC jitter");
+        }
+        const auto expected = initial + static_cast<std::int64_t>(302) * frames;
+        check(timeline.place(7000 + 302ull * frames, frames, expected, true) == expected,
+              "real missing device frames preserve their silence interval");
+        check(timeline.place(0, frames, 0, false) == expected + frames,
+              "invalid timestamps append instead of using arrival jitter");
+        check(timeline.place(900000, frames, 0, true) == expected + 2 * frames,
+              "valid timestamps resume continuously after an invalid packet");
+        check(timeline.place(0, frames, 0, true) == expected + 3 * frames,
+              "device position reset never overwrites earlier samples");
+    }
+    gifler::record::AudioPacketTimeline preroll;
+    check(preroll.place(0, 480, -240, true) == -240, "pre-epoch samples retain their position for trimming");
+    check(preroll.place(480, 480, 999, true) == 240, "pre-roll trimming does not shift later packets");
+}
+
+void audio_wave_tests() {
+    gifler::core::AudioRecording audio;
+    WAVEFORMATEX format{WAVE_FORMAT_PCM, 1, 1000, 2000, 2, 16, 0};
+    const auto* data = reinterpret_cast<const std::byte*>(&format);
+    audio.waveFormat.assign(data, data + sizeof(format));
+    audio.sampleRate = 1000;
+    audio.blockAlign = 2;
+    audio.samples.resize(4000);
+    for (int i = 0; i < 2000; ++i) {
+        const auto value = static_cast<std::int16_t>(i);
+        std::memcpy(audio.samples.data() + i * 2, &value, 2);
+    }
+    auto first = make_timed_frame(2, 2, 0, 5'000'000);
+    first.timestampTicks = 10'000'000;
+    auto second = first;
+    second.timestampTicks = 0;
+    const auto path = std::filesystem::temp_directory_path() / L"gifler_audio_timeline_test.wav";
+    gifler::exporting::write_audio_wave(path, audio, {first, second});
+    std::ifstream input(path, std::ios::binary);
+    const auto header = 28 + sizeof(format);
+    input.seekg(header);
+    std::int16_t sample = 0;
+    input.read(reinterpret_cast<char*>(&sample), 2);
+    check(sample == 1000, "audio follows edited frame timestamp");
+    input.seekg(header + 1000);
+    input.read(reinterpret_cast<char*>(&sample), 2);
+    check(sample == 0, "audio splices selected frame intervals in timeline order");
+    input.close();
+    check(std::filesystem::file_size(path) == header + 2000, "audio duration matches selected video duration");
+    std::filesystem::remove(path);
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 3 && std::string(argv[1]) == "--audio-wave-probe") {
+        gifler::record::LoopbackAudio audio;
+        audio.start(gifler::record::clock_100ns());
+        std::this_thread::sleep_for(std::chrono::seconds(4));
+        audio.stop();
+        if (!audio.error().empty() || audio.recording().samples.empty()) return 1;
+        gifler::exporting::write_audio_wave(argv[2], audio.recording(),
+            {make_timed_frame(2, 2, 0, 40'000'000)});
+        std::cout << "Captured " << audio.recording().samples.size() << " bytes\n";
+        return 0;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--audio-probe") {
+        gifler::record::LoopbackAudio audio;
+        audio.start(gifler::record::clock_100ns());
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        audio.stop();
+        std::wcout << L"WASAPI loopback: " << audio.recording().sampleRate << L" Hz, "
+                   << audio.recording().samples.size() << L" bytes, " << audio.error() << L"\n";
+        return audio.recording().sampleRate && audio.error().empty() ? 0 : 1;
+    }
     geometry_tests();
+    aspect_ratio_tests();
     frame_differ_tests();
     planner_tests();
     settings_tests();
@@ -290,6 +487,8 @@ int main() {
     duplicate_coalescer_tests();
     frame_store_tests();
     recorder_session_tests();
+    audio_wave_tests();
+    audio_packet_timeline_tests();
 
     if (failures != 0) {
         std::cerr << failures << " test failure(s).\n";

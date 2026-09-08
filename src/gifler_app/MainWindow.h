@@ -4,6 +4,7 @@
 #include "gifler_core/Settings.h"
 #include "gifler_export/GifRecordingExporter.h"
 #include "gifler_record/RecorderSession.h"
+#include "gifler_win32/ResizeOverlay.h"
 
 #include <Windows.h>
 
@@ -11,6 +12,7 @@
 #include <atomic>
 #include <filesystem>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -27,6 +29,7 @@ public:
     int run_message_loop();
 
 private:
+    friend struct MainWindowTestAccess;
     enum ControlId : int {
         RecButton = 1001,
         CursorButton = 1002,
@@ -39,16 +42,51 @@ private:
         Fps10 = 1110,
         Fps15 = 1115,
         Fps30 = 1130,
+        Fps24 = 1124,
+        Fps48 = 1148,
+        Fps60 = 1160,
+        Fps120 = 1220,
+        FpsCustom = 1199,
+        FpsButton = 1600,
+        FormatButton = 1601,
+        MoreButton = 1602,
+        MinimizeButton = 1603,
+        MaximizeButton = 1604,
+        CloseButton = 1605,
         ExportGif = 1201,
         ExportMp4 = 1202,
         ExportWebP = 1203,
         ExportWebM = 1204,
+        ExportSocialMp4 = 1205,
+        AspectFree = 1800,
+        Audio48k = 1900,
+        Audio441k = 1901,
+        AudioButton = 1300,
+        TargetNone = 1400,
+        Target5 = 1405,
+        Target10 = 1410,
+        Target20 = 1420,
+        Target50 = 1450,
+        Target100 = 1500,
     };
 
     static LRESULT CALLBACK static_window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     LRESULT window_proc(UINT message, WPARAM wParam, LPARAM lParam);
 
     void create_menu();
+    void create_chrome();
+    void layout_chrome(int width, int height);
+    std::wstring dropdown_label(int control) const;
+    int dropdown_width(int control) const;
+    void refresh_chrome();
+    void refresh_fonts();
+    void paint_chrome(HDC dc, const RECT& client);
+    void draw_button(const DRAWITEMSTRUCT& item);
+    void show_popup(HMENU menu, int control);
+    void select_fps(int fps);
+    void select_aspect_ratio(int index);
+    void fit_window_aspect();
+    [[nodiscard]] gifler::core::PixelSize capture_chrome_size() const;
     void save_preferences();
     void update_menu_state();
     void update_window_title();
@@ -56,6 +94,7 @@ private:
     [[nodiscard]] gifler::core::PixelRect capture_rect_snapshot() const;
     [[nodiscard]] gifler::core::PixelRect current_capture_rect() const;
     void layout();
+    void update_resize_overlay();
     void paint();
     void apply_capture_or_preview_region();
     void update_status_rect_text();
@@ -83,14 +122,18 @@ private:
     int scaled(int value) const;
 
     HWND hwnd_ = nullptr;
+    win32::ResizeOverlay resizeOverlay_;
     HINSTANCE instance_ = nullptr;
     unsigned dpi_ = 96;
     bool previewMode_ = false;
+    bool applyingRegion_ = false;
+    std::optional<gifler::core::PixelRect> appliedHole_;
     bool recording_ = false;
     bool previewPlaying_ = false;
     bool captureCursor_ = true;
     int selectedFps_ = 10;
     int selectedExportFormat_ = 0;
+    std::size_t recordingRevision_ = 0;
     std::size_t previewFrameIndex_ = 0;
     gifler::record::RecorderSession recorder_{};
     std::vector<gifler::core::BgraFrame> editedFrames_{};
@@ -104,6 +147,7 @@ private:
     gifler::core::AppSettings settings_{};
     std::filesystem::path settingsPath_{};
     std::atomic_bool saving_ = false;
+    std::atomic_bool cancelExport_ = false;
     std::thread saveThread_{};
     std::mutex saveResultMutex_{};
     bool saveResultSuccess_ = false;
@@ -114,12 +158,19 @@ private:
     std::size_t saveResultFrameCount_ = 0;
     std::wstring saveProgressLabel_{};
 
-    HMENU menuBar_ = nullptr;
     HMENU commandMenu_ = nullptr;
     HMENU fpsMenu_ = nullptr;
     HMENU exportMenu_ = nullptr;
-    UINT exportMenuPosition_ = 0;
+    HMENU targetMenu_ = nullptr;
+    HMENU aspectMenu_ = nullptr;
+    HMENU audioRateMenu_ = nullptr;
     HWND saveProgress_ = nullptr;
+    HWND tooltips_ = nullptr;
+    HFONT uiFont_ = nullptr;
+    HFONT titleFont_ = nullptr;
+    HFONT iconFont_ = nullptr;
+    bool highContrast_ = false;
+    bool compactFps_ = false;
 };
 
 } // namespace gifler::app

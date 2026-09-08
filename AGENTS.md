@@ -19,7 +19,7 @@ Build Gifler as a native Windows C++ replacement for a GifCam-style recorder. St
 
 The application includes:
 
-- a working Win32 application with a color-keyed click-through viewfinder,
+- a working Win32 application with a region-cut click-through viewfinder,
 - a window-hole spike,
 - a DXGI capture-once spike,
 - an asynchronous recording and export pipeline,

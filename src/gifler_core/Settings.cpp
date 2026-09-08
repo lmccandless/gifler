@@ -1,6 +1,8 @@
 #include "gifler_core/Settings.h"
+#include "gifler_core/AspectRatio.h"
 
 #include <cstdlib>
+#include <cmath>
 #include <fstream>
 #include <sstream>
 
@@ -49,6 +51,14 @@ AppSettings load_settings_or_defaults(const std::filesystem::path& path) {
                 settings.lastExportFormat = std::stoi(value);
             } else if (key == "captureCursor") {
                 settings.captureCursor = value == "true" || value == "1";
+            } else if (key == "captureAudio") {
+                settings.captureAudio = value == "true" || value == "1";
+            } else if (key == "captureAspectRatio") {
+                settings.captureAspectRatio = std::stoi(value);
+            } else if (key == "socialMp4") {
+                settings.socialMp4 = value == "true" || value == "1";
+            } else if (key == "mp4AudioSampleRate") {
+                settings.mp4AudioSampleRate = std::stoi(value);
             } else if (key == "target.displayMb") {
                 settings.target.displayTargetMb = std::stod(value);
             } else if (key == "target.internalMb") {
@@ -62,12 +72,19 @@ AppSettings load_settings_or_defaults(const std::filesystem::path& path) {
             // Keep defaults for malformed values.
         }
     }
-    if (settings.defaultFps != 5 && settings.defaultFps != 10 && settings.defaultFps != 15 && settings.defaultFps != 30) {
+    if (settings.defaultFps < 1 || settings.defaultFps > 240) {
         settings.defaultFps = 10;
     }
     if (settings.lastExportFormat < 0 || settings.lastExportFormat > 3) {
         settings.lastExportFormat = 0;
     }
+    if (settings.captureAspectRatio < 0 || settings.captureAspectRatio >= static_cast<int>(CaptureAspectRatios.size()))
+        settings.captureAspectRatio = 0;
+    if (settings.mp4AudioSampleRate != 44100 && settings.mp4AudioSampleRate != 48000)
+        settings.mp4AudioSampleRate = 48000;
+    if (!std::isfinite(settings.target.displayTargetMb) || settings.target.displayTargetMb < 0 ||
+        settings.target.displayTargetMb > 100) settings.target.displayTargetMb = 10;
+    settings.target.internalSafetyTargetMb = settings.target.displayTargetMb * 0.95;
     return settings;
 }
 
@@ -81,6 +98,10 @@ void save_settings_best_effort(const std::filesystem::path& path, const AppSetti
         output << "defaultFps=" << settings.defaultFps << "\n";
         output << "lastExportFormat=" << settings.lastExportFormat << "\n";
         output << "captureCursor=" << bool_text(settings.captureCursor) << "\n";
+        output << "captureAudio=" << bool_text(settings.captureAudio) << "\n";
+        output << "captureAspectRatio=" << settings.captureAspectRatio << "\n";
+        output << "socialMp4=" << bool_text(settings.socialMp4) << "\n";
+        output << "mp4AudioSampleRate=" << settings.mp4AudioSampleRate << "\n";
         output << "target.displayMb=" << settings.target.displayTargetMb << "\n";
         output << "target.internalMb=" << settings.target.internalSafetyTargetMb << "\n";
         output << "target.minimumFps=" << settings.target.minimumFps << "\n";

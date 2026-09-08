@@ -313,7 +313,7 @@ struct DxgiCaptureProvider::Impl {
 
         DXGI_OUTDUPL_FRAME_INFO frameInfo{};
         ComPtr<IDXGIResource> desktopResource;
-        HRESULT hr = duplication->AcquireNextFrame(250, &frameInfo, &desktopResource);
+        HRESULT hr = duplication->AcquireNextFrame(cachedFrame.empty() ? 100 : 0, &frameInfo, &desktopResource);
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
             if (cachedRect == rect && !cachedFrame.empty()) {
                 output = cachedFrame;
@@ -355,6 +355,10 @@ struct DxgiCaptureProvider::Impl {
 
         D3D11_TEXTURE2D_DESC sourceDesc{};
         desktopTexture->GetDesc(&sourceDesc);
+        if (selected.desc.Rotation != DXGI_MODE_ROTATION_IDENTITY && selected.desc.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED) {
+            if (error) *error = L"Rotated displays are not supported by this capture backend.";
+            return false;
+        }
         if (!ensure_staging(sourceDesc, rect, error)) {
             return false;
         }
@@ -366,6 +370,10 @@ struct DxgiCaptureProvider::Impl {
         sourceBox.right = sourceBox.left + static_cast<UINT>(rect.width);
         sourceBox.bottom = sourceBox.top + static_cast<UINT>(rect.height);
         sourceBox.back = 1;
+        if (sourceBox.right > sourceDesc.Width || sourceBox.bottom > sourceDesc.Height) {
+            if (error) *error = L"Capture rectangle exceeds the desktop texture.";
+            return false;
+        }
         context->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, desktopTexture.Get(), 0, &sourceBox);
 
         D3D11_MAPPED_SUBRESOURCE mapped{};
@@ -376,6 +384,11 @@ struct DxgiCaptureProvider::Impl {
             }
             return false;
         }
+        struct UnmapGuard {
+            ID3D11DeviceContext* context;
+            ID3D11Texture2D* texture;
+            ~UnmapGuard() { context->Unmap(texture, 0); }
+        } unmap{context.Get(), staging.Get()};
 
         output.width = rect.width;
         output.height = rect.height;
@@ -388,7 +401,6 @@ struct DxgiCaptureProvider::Impl {
                         source + static_cast<std::size_t>(y) * static_cast<std::size_t>(mapped.RowPitch),
                         static_cast<std::size_t>(output.width) * 4u);
         }
-        context->Unmap(staging.Get(), 0);
 
         LARGE_INTEGER qpc{};
         QueryPerformanceCounter(&qpc);

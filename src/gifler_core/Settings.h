@@ -25,6 +25,10 @@ struct AppSettings {
     int defaultFps = 10;
     int lastExportFormat = 0;
     bool captureCursor = true;
+    bool captureAudio = false;
+    int captureAspectRatio = 0;
+    bool socialMp4 = false;
+    int mp4AudioSampleRate = 48000;
     EncoderSettings encoders{};
     ExportTargetSettings target{};
 };

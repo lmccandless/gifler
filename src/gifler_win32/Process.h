@@ -17,10 +17,12 @@ struct ProcessResult {
 
 [[nodiscard]] std::wstring join_command_line(const std::filesystem::path& exe, const std::vector<std::wstring>& args);
 [[nodiscard]] ProcessResult run_process_wait(const std::filesystem::path& exe, const std::vector<std::wstring>& args,
-                                             const std::filesystem::path& workingDirectory = {});
+                                             const std::filesystem::path& workingDirectory = {},
+                                             const std::function<bool()>& canceled = {});
 [[nodiscard]] ProcessResult run_process_with_input(const std::filesystem::path& exe,
                                                    const std::vector<std::wstring>& args,
                                                    const std::function<bool(HANDLE)>& writeInput,
-                                                   const std::filesystem::path& workingDirectory = {});
+                                                   const std::filesystem::path& workingDirectory = {},
+                                                   const std::function<bool()>& canceled = {});
 
 } // namespace gifler::win32

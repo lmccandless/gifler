@@ -33,11 +33,6 @@ gifler::core::BgraFrame make_synthetic_frame(int width, int height, int frameInd
     return frame;
 }
 
-std::int64_t duration_to_ticks_100ns(std::chrono::steady_clock::duration duration) {
-    const auto nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
-    return std::max<std::int64_t>(1, nanoseconds / 100);
-}
-
 } // namespace
 
 RecorderSession::~RecorderSession() {
@@ -46,6 +41,9 @@ RecorderSession::~RecorderSession() {
 
 void RecorderSession::prepare_start(RecorderSettings settings) {
     stop();
+    recordedFps_ = settings.fps;
+    capturedFrames_ = 0;
+    audio_.clear();
     store_.clear();
     set_last_error({});
     stopRequested_ = false;
@@ -54,7 +52,9 @@ void RecorderSession::prepare_start(RecorderSettings settings) {
 }
 
 void RecorderSession::start_recording_worker(std::shared_ptr<BoundedFrameQueue<gifler::core::BgraFrame>> queue) {
+    try {
     recordingThread_ = std::thread([this, queue = std::move(queue)] {
+      try {
         DuplicateFrameCoalescer coalescer;
         while (auto frame = queue->pop()) {
             coalescer.push(std::move(*frame));
@@ -66,7 +66,20 @@ void RecorderSession::start_recording_worker(std::shared_ptr<BoundedFrameQueue<g
         if (state_.load() != RecorderState::Failed) {
             state_ = RecorderState::Completed;
         }
+      } catch (...) {
+        state_ = RecorderState::Failed;
+        stopRequested_ = true;
+        set_last_error(L"Recording storage failed. Try a smaller region or shorter recording.");
+        queue->close();
+      }
     });
+    } catch (...) {
+        stopRequested_ = true;
+        queue_->close();
+        if (captureThread_.joinable()) captureThread_.join();
+        state_ = RecorderState::Failed;
+        set_last_error(L"Could not start recording storage worker.");
+    }
 }
 
 void RecorderSession::start_synthetic(RecorderSettings settings, int width, int height) {
@@ -96,16 +109,17 @@ void RecorderSession::start_dxgi(RecorderSettings settings, std::function<gifler
     prepare_start(settings);
 
     captureThread_ = std::thread([this, settings, captureRectProvider = std::move(captureRectProvider), queue = queue_] {
+      try {
         const int fps = settings.fps <= 0 ? 10 : settings.fps;
-        const auto frameDelay = std::chrono::milliseconds(1000 / fps);
-        const std::int64_t frameDurationTicks = 10'000'000LL / fps;
+        const auto frameDelay = std::chrono::nanoseconds(1'000'000'000LL / fps);
         gifler::capture_dxgi::DxgiCaptureProvider capture;
         int consecutiveFailures = 0;
-        auto previousFrameTime = std::chrono::steady_clock::now();
-        bool hasPreviousFrame = false;
+        const auto epoch = clock_100ns();
+        auto deadline = std::chrono::steady_clock::now();
+        if (settings.captureAudio) audio_.start(epoch);
+        gifler::core::BgraFrame pending;
 
         while (!stopRequested_.load()) {
-            const auto captureStart = std::chrono::steady_clock::now();
             gifler::core::BgraFrame frame;
             std::wstring error;
             const auto captureRect = captureRectProvider();
@@ -115,18 +129,16 @@ void RecorderSession::start_dxgi(RecorderSettings settings, std::function<gifler
                 continue;
             }
             if (capture.capture_composed_frame(captureRect, frame, &error, settings.captureCursor)) {
-                const auto capturedAt = std::chrono::steady_clock::now();
-                if (hasPreviousFrame) {
-                    frame.durationTicks = duration_to_ticks_100ns(capturedAt - previousFrameTime);
+                ++capturedFrames_;
+                const auto capturedAt = clock_100ns() - epoch;
+                frame.timestampTicks = capturedAt;
+                if (!pending.empty()) {
+                    pending.durationTicks = std::max<std::int64_t>(1, capturedAt - pending.timestampTicks);
+                    if (!queue->push(std::move(pending))) break;
                 } else {
-                    const auto firstFrameTicks = duration_to_ticks_100ns(capturedAt - previousFrameTime);
-                    frame.durationTicks = std::max(frameDurationTicks, firstFrameTicks);
-                    hasPreviousFrame = true;
+                    frame.timestampTicks = 0;
                 }
-                previousFrameTime = capturedAt;
-                if (!queue->push(std::move(frame))) {
-                    break;
-                }
+                pending = std::move(frame);
                 consecutiveFailures = 0;
             } else {
                 ++consecutiveFailures;
@@ -137,11 +149,20 @@ void RecorderSession::start_dxgi(RecorderSettings settings, std::function<gifler
                 }
             }
 
-            const auto captureElapsed = std::chrono::steady_clock::now() - captureStart;
-            if (captureElapsed < frameDelay) {
-                std::this_thread::sleep_for(frameDelay - captureElapsed);
-            }
+            deadline += frameDelay;
+            const auto now = std::chrono::steady_clock::now();
+            if (deadline < now) deadline = now;
+            std::this_thread::sleep_until(deadline);
         }
+        if (!pending.empty()) {
+            pending.durationTicks = std::max<std::int64_t>(1, clock_100ns() - epoch - pending.timestampTicks);
+            queue->push(std::move(pending));
+        }
+      } catch (...) {
+        set_last_error(L"Recording stopped because capture resources could not be allocated.");
+        state_ = RecorderState::Failed;
+      }
+        audio_.stop();
         queue->close();
     });
 
@@ -150,15 +171,14 @@ void RecorderSession::start_dxgi(RecorderSettings settings, std::function<gifler
 
 void RecorderSession::stop() {
     stopRequested_ = true;
-    if (queue_) {
-        queue_->close();
-    }
     if ((captureThread_.joinable() || recordingThread_.joinable()) && state_.load() != RecorderState::Failed) {
         state_ = RecorderState::Stopping;
     }
     if (captureThread_.joinable()) {
         captureThread_.join();
     }
+    audio_.stop();
+    if (queue_) queue_->close();
     if (recordingThread_.joinable()) {
         recordingThread_.join();
     }
